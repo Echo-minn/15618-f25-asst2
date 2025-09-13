@@ -87,8 +87,6 @@ void exclusive_scan(int *device_data, int length)
             int grid = (nThreads + block - 1) / block;
             upsweep_kernel<<<grid, block>>>(device_data, N, twod);
         }
-        // parallel_for (int i = 0; i < length; i += twod1)
-        //     data[i+twod1-1] += data[i+twod-1];
     }
     
     cudaMemset(device_data + (N - 1), 0, sizeof(int));
@@ -96,19 +94,12 @@ void exclusive_scan(int *device_data, int length)
     // downsweep phase.
     for (int twod = (N >> 1); twod >= 1; twod >>= 1)
     {
-        int twod1 = twod << 2;
+        int twod1 = twod << 1;
         int nThreads = N / twod1;
         if (nThreads > 0) {
             int grid = (nThreads + block - 1) / block;
             downsweep_kernel<<<grid, block>>>(device_data, N, twod);
         }
-        // parallel_for(int i = 0; i < length; i += twod1)
-        // {
-        //     int t = data[i + twod - 1];
-        //     data[i + twod - 1] = data[i + twod1 - 1];
-        //     // change twod1 below to twod to reverse prefix sum.
-        //     data[i + twod1 - 1] += t;
-        // }
     }
 }
 
@@ -228,7 +219,7 @@ int find_peaks(int *device_input, int length, int *device_output)
 
     // 2) Scan mask (exclusive)
     cudaMemcpy(device_scan, device_mask, N * sizeof(int), cudaMemcpyDeviceToDevice);
-    exclusive_scan(device_scan, length); // handles zero-padding internally
+    exclusive_scan(device_scan, length);
 
     // 3) Total peaks = scan[length-1] + mask[length-1]
     int lastScan = 0, lastMask = 0;
