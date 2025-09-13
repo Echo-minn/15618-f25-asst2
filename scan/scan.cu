@@ -27,6 +27,32 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void fill_tail_zeros(int* data, int start, int Np2) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = start + i;
+    if (idx < Np2) data[idx] = 0;
+}
+
+__global__ void upsweep_kernel(int* data, int N, int twod) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = (twod << 1);
+    int index  = stride * (tid + 1) - 1;
+    if (index < N) {
+        data[index] += data[index - twod];
+    }
+}
+
+__global__ void downsweep_kernel(int* data, int N, int twod) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = (twod << 1);
+    int index  = stride * (tid + 1) - 1;
+    if (index < N) {
+        int t = data[index - twod];
+        data[index - twod] = data[index];
+        data[index] += t;
+    }
+}
+
 void exclusive_scan(int *device_data, int length)
 {
     /* TODO
@@ -41,40 +67,41 @@ void exclusive_scan(int *device_data, int length)
      * both the data array is sized to accommodate the next
      * power of 2 larger than the input.
      */
-    __global__ void upsweep_kernel(int* device_data, int length, int twod1, int twod)
-    {
-        int index = blockIdx.x * blockDim.x + threadIdx.x;
-        if (index < length)
-        {
-            device_data[index + twod1 - 1] += device_data[index + twod - 1];
-        }
+    assert(length > 0);
+    int N = nextPow2(length);
+    const int block = 256;
+
+    // padding to power of 2
+    if (N > length) {
+        int pad_length = N - length;
+        int grid = (pad_length + block - 1) / block;
+        fill_tail_zeros<<<grid, block>>>(device_data, length, N);
     }
-    __global__ void downsweep_kernel(int* device_data, int length, int twod1, int twod)
-    {
-        int index = blockIdx.x * blockDim.x + threadIdx.x;
-        if (index < length)
-        {
-            int t = device_data[index + twod - 1];
-            device_data[index + twod - 1] = device_data[index + twod1 - 1];
-            device_data[index + twod1 - 1] += t;
-        }
-    }
+
     // upsweep phase.
-    for (int twod = 1; twod < length; twod *= 2)
+    for (int twod = 1; twod < N; twod <<= 1)
     {
-        int twod1 = twod * 2;
-        // parallel cuda kernel
-        upsweep_kernel<<<length / twod1, twod1>>>(device_data, length, twod1, twod);
+        int twod1 = twod << 1;
+        int nThreads = N / twod1;
+        if (nThreads > 0) {
+            int grid = (nThreads + block - 1) / block;
+            upsweep_kernel<<<grid, block>>>(device_data, N, twod);
+        }
         // parallel_for (int i = 0; i < length; i += twod1)
         //     data[i+twod1-1] += data[i+twod-1];
     }
-    data[N - 1] = 0;
+    
+    cudaMemset(device_data + (N - 1), 0, sizeof(int));
+
     // downsweep phase.
-    for (int twod = length / 2; twod >= 1; twod /= 2)
+    for (int twod = (N >> 1); twod >= 1; twod >>= 1)
     {
-        int twod1 = twod * 2;
-        // parallel cuda kernel
-        downsweep_kernel<<<length / twod1, twod1>>>(device_data, length, twod1, twod);
+        int twod1 = twod << 2;
+        int nThreads = N / twod1;
+        if (nThreads > 0) {
+            int grid = (nThreads + block - 1) / block;
+            downsweep_kernel<<<grid, block>>>(device_data, N, twod);
+        }
         // parallel_for(int i = 0; i < length; i += twod1)
         // {
         //     int t = data[i + twod - 1];
@@ -149,6 +176,24 @@ double cudaScanThrust(int *inarray, int *end, int *resultarray)
     return overallDuration;
 }
 
+__global__ void peak_mask_kernel(const int *in, int length, int *mask, int Np2)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= Np2) return;
+    if (i == 0 || i >= length - 1) { mask[i] = 0; return; }
+    int a = in[i - 1], b = in[i], c = in[i + 1];
+    mask[i] = (b > a && b > c) ? 1 : 0;
+}
+
+__global__ void scatter_kernel(const int* mask, const int* scan, int length, int* out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= length) return;
+    if (mask[i]) {
+        int j = scan[i];
+        out[j] = i;
+    }
+}
+
 int find_peaks(int *device_input, int length, int *device_output)
 {
     /* TODO:
@@ -165,10 +210,38 @@ int find_peaks(int *device_input, int length, int *device_output)
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
-    printf("length: %d\n", length);
-    
-    
-    return 0;
+
+    assert(length >= 3);
+
+    int N = nextPow2(length);
+    const int block = 256;
+    int grid_N = (N + block - 1) / block;
+    int grid_len = (length + block - 1) / block;
+
+    int *device_mask = nullptr;
+    int *device_scan = nullptr;
+    cudaMalloc(&device_mask, N * sizeof(int));
+    cudaMalloc(&device_scan, N * sizeof(int));
+
+    // 1) Build mask
+    peak_mask_kernel<<<grid_N, block>>>(device_input, length, device_mask, N);
+
+    // 2) Scan mask (exclusive)
+    cudaMemcpy(device_scan, device_mask, N * sizeof(int), cudaMemcpyDeviceToDevice);
+    exclusive_scan(device_scan, length); // handles zero-padding internally
+
+    // 3) Total peaks = scan[length-1] + mask[length-1]
+    int lastScan = 0, lastMask = 0;
+    cudaMemcpy(&lastScan, device_scan + (length - 1), sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&lastMask, device_mask + (length - 1), sizeof(int), cudaMemcpyDeviceToHost);
+    int total = lastScan + lastMask;
+
+    // 4) Scatter indices
+    scatter_kernel<<<grid_len, block>>>(device_mask, device_scan, length, device_output);
+
+    cudaFree(device_mask);
+    cudaFree(device_scan);
+    return total;
 }
 
 /* Timing wrapper around find_peaks. You should not modify this function.
