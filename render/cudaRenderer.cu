@@ -325,6 +325,23 @@ __global__ void kernelAdvanceSnowflake()
     *((float3 *)velocityPtr) = velocity;
 }
 
+
+__device__ inline void atomicBlendAssign(float *addr, float alpha, float src)
+{
+    int *iaddr = reinterpret_cast<int *>(addr);
+    int old = *iaddr;
+    while (true)
+    {
+        float oldf = __int_as_float(old);
+        float newf = alpha * src + (1.f - alpha) * oldf;
+        int newi = __float_as_int(newf);
+        int prev = atomicCAS(iaddr, old, newi);
+        if (prev == old)
+            break;
+        old = prev;
+    }
+}
+
 // shadePixel -- (CUDA device code)
 //
 // Given a pixel and a circle, determine the contribution to the
@@ -381,22 +398,6 @@ shadePixel(float2 pixelCenter, float3 p, float4 *imagePtr, int circleIndex)
 
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
-
-    __device__ inline void atomicBlendAssign(float *addr, float alpha, float src)
-    {
-        int *iaddr = reinterpret_cast<int *>(addr);
-        int old = *iaddr;
-        while (true)
-        {
-            float oldf = __int_as_float(old);
-            float newf = alpha * src + (1.f - alpha) * oldf;
-            int newi = __float_as_int(newf);
-            int prev = atomicCAS(iaddr, old, newi);
-            if (prev == old)
-                break;
-            old = prev;
-        }
-    }
 
     atomicBlendAssign(&(imagePtr->x), alpha, rgb.x);
     atomicBlendAssign(&(imagePtr->y), alpha, rgb.y);
