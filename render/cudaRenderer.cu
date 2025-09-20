@@ -465,81 +465,74 @@ __global__ void kernelRenderCircles()
 __global__ void kernelRenderPixels()
 {
 
-    int offsetX = blockIdx.x * blockDim.x + threadIdx.x;
-    int offsetY = blockIdx.y * blockDim.y + threadIdx.y;
+    int imageX = blockIdx.x * blockDim.x + threadIdx.x;
+    int imageY = blockIdx.y * blockDim.y + threadIdx.y;
 
     int width = cuConstRendererParams.imageWidth;
     int height = cuConstRendererParams.imageHeight;
 
-    if (offsetX >= width || offsetY >= height)
-    {
+    if (imageX >= width || imageY >= height)
         return;
-    }
 
-    int offset = 4 * (offsetY * width + offsetX);
+    int offset = 4 * (imageY * width + imageX);
 
-    // read current pixel color
-    float4 pixelColor = *(float4 *)(&cuConstRendererParams.imageData[offset]);
-    float r = pixelColor.x;
-    float g = pixelColor.y;
-    float b = pixelColor.z;
-    float a = pixelColor.w;
+    // Load current pixel color (cleared previously)
+    float4 accum = *(float4 *)(&cuConstRendererParams.imageData[offset]);
+    float r = accum.x;
+    float g = accum.y;
+    float b = accum.z;
+    float a = accum.w;
 
-    // pixel center
+    // Pixel center in normalized coordinates
     float invWidth = 1.f / width;
     float invHeight = 1.f / height;
-    float2 pixelCenterNorm = make_float2(
-        invWidth * (static_cast<float>(offsetX) + 0.5f),
-        invHeight * (static_cast<float>(offsetY) + 0.5f));
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(imageX) + 0.5f),
+                                         invHeight * (static_cast<float>(imageY) + 0.5f));
 
+    // Loop over circles in input order
     int numCircles = cuConstRendererParams.numberOfCircles;
-    // for every circle that contain this pixel
     for (int i = 0; i < numCircles; i++)
     {
         int index3 = 3 * i;
         float3 p = *(float3 *)(&cuConstRendererParams.position[index3]);
         float rad = cuConstRendererParams.radius[i];
 
+        // Quick reject
         float diffX = p.x - pixelCenterNorm.x;
         float diffY = p.y - pixelCenterNorm.y;
         float pixelDist = diffX * diffX + diffY * diffY;
         float maxDist = rad * rad;
-
-        // Circle does not contribute to the image
         if (pixelDist > maxDist)
-            return;
+            continue;
 
+        // Shade: compute rgb and alpha for this circle at this pixel
         float3 rgb;
         float alpha;
-
         if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
         {
             const float kCircleMaxAlpha = .5f;
             const float falloffScale = 4.f;
-
-            float normPixelDist = sqrt(pixelDist) / rad;
+            float normPixelDist = sqrtf(pixelDist) / rad;
             rgb = lookupColor(normPixelDist);
-
             float maxAlpha = .6f + .4f * (1.f - p.z);
-            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
-            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+            alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
         }
         else
         {
-            // Simple: each circle has an assigned color
             rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
             alpha = .5f;
         }
 
-        float oneMinusAlpha = 1.f - alpha;
-        r = alpha * rgb.x + oneMinusAlpha * r;
-        g = alpha * rgb.y + oneMinusAlpha * g;
-        b = alpha * rgb.z + oneMinusAlpha * b;
-        a = alpha + a;
+        // In-order blend into this pixel (local registers)
+        float oneMinus = 1.f - alpha;
+        r = alpha * rgb.x + oneMinus * r;
+        g = alpha * rgb.y + oneMinus * g;
+        b = alpha * rgb.z + oneMinus * b;
+        a = a + alpha;
     }
 
-    float4 value = make_float4(r, g, b, a);
-    *(float4 *)(&cuConstRendererParams.imageData[offset]) = value;
+    *(float4 *)(&cuConstRendererParams.imageData[offset]) = make_float4(r, g, b, a);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -778,7 +771,7 @@ void CudaRenderer::advanceAnimation()
 void CudaRenderer::render()
 {
     // Per-pixel rendering: 16x16 blocks over the image
-    dim3 blockDim(16, 16, 1);
+    dim3 blockDim(32, 32, 1);
     dim3 gridDim(
         (image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y);
