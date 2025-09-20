@@ -485,17 +485,17 @@ __global__ void kernelRenderPixels()
     float a = pixelColor.w;
 
     // pixel center
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
+    float invWidth = 1.f / width;
+    float invHeight = 1.f / height;
     float2 pixelCenterNorm = make_float2(
-        invWidth * (static_cast<float>(pixelX) + 0.5f),
-        invHeight * (static_cast<float>(pixelY) + 0.5f));
+        invWidth * (static_cast<float>(offsetX) + 0.5f),
+        invHeight * (static_cast<float>(offsetY) + 0.5f));
 
     int  numCircles = cuConstRendererParams.numberOfCircles;
     // for every circle that contain this pixel
     for (int i=0; i< numCircles; i++) {
         float3 p = *(float3 *)(&cuConstRendererParams.position[3*i]);
-        float rad = cuConstRendererParams.radius[i]
+        float rad = cuConstRendererParams.radius[i];
 
         float diffX = p.x - pixelCenterNorm.x;
         float diffY = p.y - pixelCenterNorm.y;
