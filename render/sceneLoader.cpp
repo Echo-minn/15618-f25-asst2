@@ -521,5 +521,5 @@ loadCircleScene(
         return;
     }
 
-    printf("Loaded scene with %d circles, radius: %d\n", numCircles, radius);
+    printf("Loaded scene with %d circles\n", numCircles);
 }

@@ -996,8 +996,27 @@ void CudaRenderer::render()
     // Tiled, order-correct rendering using CSR bins (built each frame)
 
     // 1) Compute tile grid (align block=tile; keep <=1024 threads per block)
+    // Tile size selection can be tuned based on the distribution of circle sizes:
+    // - For many small circles: use smaller tiles to reduce overdraw and improve parallelism,
+    //   since each tile will likely only overlap a few circles.
+    // - For a few big circles: use larger tiles to reduce the number of tiles each large circle touches,
+    //   minimizing redundant work and binning overhead.
+    // Here, we use a default, but you could adaptively set tileW/tileH based on scene statistics.
     int tileW = 16;
     int tileH = 16;
+
+    if (numberOfCircles > 1024 && numberOfCircles <= 10000)
+    {
+        tileW = 32;
+        tileH = 32;
+    }
+    
+    if (numberOfCircles > 10000 && numberOfCircles <= 100000)
+    {
+        tileW = 8;
+        tileH = 8;
+    }
+    
     const int tilesX = (image->width + tileW - 1) / tileW;
     const int tilesY = (image->height + tileH - 1) / tileH;
     const int numTiles = tilesX * tilesY;
