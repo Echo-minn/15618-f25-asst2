@@ -531,6 +531,8 @@ __global__ void kernelRenderPixels()
         g = alpha * rgb.y + oneMinus * g;
         b = alpha * rgb.z + oneMinus * b;
         a = a + alpha;
+        if (a > 0.99f)
+            break;
     }
 
     *(float4 *)(&cuConstRendererParams.imageData[offset]) = make_float4(r, g, b, a);
@@ -704,43 +706,88 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
     int begin = tileOffsets[tileId];
     int end = tileOffsets[tileId + 1];
 
-    for (int k = begin; k < end; k++)
+    // Shared-memory batching of circles for this tile
+    extern __shared__ unsigned char sMem[];
+    const int batchSize = 64; // tune as needed; small shared footprint
+    float3 *sP = (float3 *)sMem;
+    float *sR = (float *)&sP[batchSize];
+
+    int threadsPerBlock = blockDim.x * blockDim.y;
+    int linearTid = threadIdx.y * blockDim.x + threadIdx.x;
+    bool done = false;
+
+    for (int k = begin; k < end; k += batchSize)
     {
-        int i = tileIndices[k];
-        int index3 = 3 * i;
-        float3 p = *(float3 *)(&cuConstRendererParams.position[index3]);
-        float rad = cuConstRendererParams.radius[i];
+        int n = min(batchSize, end - k);
 
-        float diffX = p.x - pixelCenterNorm.x;
-        float diffY = p.y - pixelCenterNorm.y;
-        float pixelDist = diffX * diffX + diffY * diffY;
-        float maxDist = rad * rad;
-        if (pixelDist > maxDist)
+        // Cooperative load of this batch into shared memory
+        for (int t = linearTid; t < n; t += threadsPerBlock)
+        {
+            int ci = tileIndices[k + t];
+            int index3 = 3 * ci;
+            sP[t] = *(float3 *)(&cuConstRendererParams.position[index3]);
+            sR[t] = cuConstRendererParams.radius[ci];
+        }
+        __syncthreads();
+
+        // Shade against the batch
+        if (!done)
+        {
+            for (int j = 0; j < n; ++j)
+            {
+                float3 p = sP[j];
+                float rad = sR[j];
+
+                float diffX = p.x - pixelCenterNorm.x;
+                float diffY = p.y - pixelCenterNorm.y;
+                float pixelDist = diffX * diffX + diffY * diffY;
+                float maxDist = rad * rad;
+                if (pixelDist > maxDist)
+                    continue;
+
+                float3 rgb;
+                float alpha;
+                if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
+                {
+                    const float kCircleMaxAlpha = .5f;
+                    const float falloffScale = 4.f;
+                    float normPixelDist = sqrtf(pixelDist) / rad;
+                    rgb = lookupColor(normPixelDist);
+                    float maxAlpha = .6f + .4f * (1.f - p.z);
+                    maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+                    alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
+                }
+                else
+                {
+                    int dummyIndex3 = 0; // unused, keep identical math to original
+                    rgb = *(float3 *)&(cuConstRendererParams.color[dummyIndex3]);
+                    // Fetch color using p.z as original index was order-correct; keep .5 alpha
+                    // However, since color depends on circle index, reload it here via global read
+                    // Compute circle index from current batch element
+                    int ci = tileIndices[k + j];
+                    dummyIndex3 = 3 * ci;
+                    rgb = *(float3 *)&(cuConstRendererParams.color[dummyIndex3]);
+                    alpha = .5f;
+                }
+
+                float oneMinus = 1.f - alpha;
+                r = alpha * rgb.x + oneMinus * r;
+                g = alpha * rgb.y + oneMinus * g;
+                b = alpha * rgb.z + oneMinus * b;
+                a = a + alpha;
+                if (a > 0.99f)
+                {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        __syncthreads();
+        if (done)
+        {
+            // Still must iterate batches to participate in __syncthreads, but no more work
             continue;
-
-        float3 rgb;
-        float alpha;
-        if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
-        {
-            const float kCircleMaxAlpha = .5f;
-            const float falloffScale = 4.f;
-            float normPixelDist = sqrtf(pixelDist) / rad;
-            rgb = lookupColor(normPixelDist);
-            float maxAlpha = .6f + .4f * (1.f - p.z);
-            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-            alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
         }
-        else
-        {
-            rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
-            alpha = .5f;
-        }
-
-        float oneMinus = 1.f - alpha;
-        r = alpha * rgb.x + oneMinus * r;
-        g = alpha * rgb.y + oneMinus * g;
-        b = alpha * rgb.z + oneMinus * b;
-        a = a + alpha;
     }
 
     *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]) = make_float4(r, g, b, a);
@@ -995,26 +1042,24 @@ void CudaRenderer::render()
 
     // Tiled, order-correct rendering using CSR bins (built each frame)
 
-    // 1) Compute tile grid (align block=tile; keep <=1024 threads per block)
-    // Tile size selection can be tuned based on the distribution of circle sizes:
-    // - For many small circles: use smaller tiles to reduce overdraw and improve parallelism,
-    //   since each tile will likely only overlap a few circles.
-    // - For a few big circles: use larger tiles to reduce the number of tiles each large circle touches,
-    //   minimizing redundant work and binning overhead.
-    // Here, we use a default, but you could adaptively set tileW/tileH based on scene statistics.
+    // 1) Compute tile grid adaptively by max radius (limit threads/block <= 1024)
     int tileW = 16;
     int tileH = 16;
-
-    if (numberOfCircles > 1024 && numberOfCircles <= 10000)
+    float maxR = 0.f;
+    for (int i = 0; i < numberOfCircles; i++)
+        maxR = std::max(maxR, radius[i]);
+    float maxRadPx = maxR * static_cast<float>(std::max(image->width, image->height));
+    if (maxRadPx <= 8.f)
     {
-        tileW = 32;
-        tileH = 32;
+        tileW = 8; tileH = 8; // 64 threads
     }
-    
-    if (numberOfCircles > 10000 && numberOfCircles <= 100000)
+    else if (maxRadPx <= 16.f)
     {
-        tileW = 8;
-        tileH = 8;
+        tileW = 16; tileH = 16; // 256 threads
+    }
+    else
+    {
+        tileW = 32; tileH = 32; // 1024 threads (cap)
     }
     
     const int tilesX = (image->width + tileW - 1) / tileW;
@@ -1067,7 +1112,10 @@ void CudaRenderer::render()
     // 6) Render per pixel using binned CSR lists (one block per tile)
     dim3 blockRender(tileW, tileH, 1);
     dim3 gridRender(tilesX, tilesY);
-    kernelRenderPixelsBinned<<<gridRender, blockRender>>>(dTileOffsets, dTileIndices, tilesX, tileW, tileH);
+    // Shared memory for binned renderer batches
+    const int batchSize = 64;
+    size_t sharedBytes = batchSize * (sizeof(float3) + sizeof(float));
+    kernelRenderPixelsBinned<<<gridRender, blockRender, sharedBytes>>>(dTileOffsets, dTileIndices, tilesX, tileW, tileH);
 
     // 7) Cleanup temporaries
     cudaFree(dTileCounts);
