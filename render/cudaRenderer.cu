@@ -991,8 +991,18 @@ void CudaRenderer::render()
     // Tiled, order-correct rendering using CSR bins (built each frame)
 
     // 1) Compute tile grid
-    const int tileW = 32;
-    const int tileH = 32;
+    int tileW = 4;
+    int tileH = 4;
+    if (numberOfCircles >= 100 && numberOfCircles < 1000 ) {
+        tileW = 8;
+        tileH = 8;
+    } else if (numberOfCircles >= 100 && numberOfCircles < 10000 ) {
+        tileW = 32;
+        tileH = 32;
+    } else if (numberOfCircles >= 10000 ) {
+        tileW = 64;
+        tileH = 64;
+    } 
     const int tilesX = (image->width + tileW - 1) / tileW;
     const int tilesY = (image->height + tileH - 1) / tileH;
     const int numTiles = tilesX * tilesY;
