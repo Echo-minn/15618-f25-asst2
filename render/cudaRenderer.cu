@@ -674,11 +674,15 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
                                          int tileH)
 {
 
-    int offsetX = blockIdx.x * blockDim.x + threadIdx.x;
-    int offsetY = blockIdx.y * blockDim.y + threadIdx.y;
-
+    // Map one CUDA block to one tile: threads cover the tile's pixels
     int width = cuConstRendererParams.imageWidth;
     int height = cuConstRendererParams.imageHeight;
+
+    int tileX = blockIdx.x;
+    int tileY = blockIdx.y;
+
+    int offsetX = tileX * tileW + threadIdx.x;
+    int offsetY = tileY * tileH + threadIdx.y;
 
     if (offsetX >= width || offsetY >= height)
         return;
@@ -696,8 +700,6 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(offsetX) + 0.5f),
                                          invHeight * (static_cast<float>(offsetY) + 0.5f));
 
-    int tileX = offsetX / tileW;
-    int tileY = offsetY / tileH;
     int tileId = tileY * tilesNumX + tileX;
     int begin = tileOffsets[tileId];
     int end = tileOffsets[tileId + 1];
@@ -979,30 +981,23 @@ void CudaRenderer::advanceAnimation()
 
 void CudaRenderer::render()
 {
-    // Per-pixel rendering: 16x16 blocks over the image
-    // dim3 blockDim(32, 32, 1);
-    // dim3 gridDim(
-    //     (image->width + blockDim.x - 1) / blockDim.x,
-    //     (image->height + blockDim.y - 1) / blockDim.y);
-
-    // kernelRenderPixels<<<gridDim, blockDim>>>();
-    // cudaDeviceSynchronize();
+    // Small-N fallback: direct per-pixel rendering avoids bin build overhead
+    if (numberOfCircles <= 1024)
+    {
+        dim3 blockDim(32, 32, 1);
+        dim3 gridDim(
+            (image->width + blockDim.x - 1) / blockDim.x,
+            (image->height + blockDim.y - 1) / blockDim.y);
+        kernelRenderPixels<<<gridDim, blockDim>>>();
+        cudaDeviceSynchronize();
+        return;
+    }
 
     // Tiled, order-correct rendering using CSR bins (built each frame)
 
-    // 1) Compute tile grid
-    int tileW = 4;
-    int tileH = 4;
-    if (numberOfCircles >= 100 && numberOfCircles < 1000 ) {
-        tileW = 8;
-        tileH = 8;
-    } else if (numberOfCircles >= 100 && numberOfCircles < 10000 ) {
-        tileW = 32;
-        tileH = 32;
-    } else if (numberOfCircles >= 10000 ) {
-        tileW = 64;
-        tileH = 64;
-    } 
+    // 1) Compute tile grid (align block=tile; keep <=1024 threads per block)
+    int tileW = 16;
+    int tileH = 16;
     const int tilesX = (image->width + tileW - 1) / tileW;
     const int tilesY = (image->height + tileH - 1) / tileH;
     const int numTiles = tilesX * tilesY;
@@ -1019,7 +1014,6 @@ void CudaRenderer::render()
         image->width, image->height,
         tilesX, tilesY, tileW, tileH,
         dTileCounts);
-    cudaDeviceSynchronize();
 
     // 3) Build CSR offsets on host
     std::vector<int> hCounts(numTiles);
@@ -1045,21 +1039,16 @@ void CudaRenderer::render()
         image->width, image->height,
         tilesX, tilesY, tileW, tileH,
         dTileWriteHeads, dTileOffsets, dTileIndices);
-    cudaDeviceSynchronize();
 
     // 5) Sort each tile segment by circle index to restore input order
     dim3 blockSort(256, 1, 1);
     dim3 gridSort((numTiles + blockSort.x - 1) / blockSort.x, 1, 1);
     kernelSortTileSegments<<<gridSort, blockSort>>>(dTileOffsets, dTileCounts, numTiles, dTileIndices);
-    cudaDeviceSynchronize();
 
-    // 6) Render per pixel using binned CSR lists
-    dim3 blockRender(32, 32, 1);
-    dim3 gridRender(
-        (image->width + blockRender.x - 1) / blockRender.x,
-        (image->height + blockRender.y - 1) / blockRender.y);
+    // 6) Render per pixel using binned CSR lists (one block per tile)
+    dim3 blockRender(tileW, tileH, 1);
+    dim3 gridRender(tilesX, tilesY);
     kernelRenderPixelsBinned<<<gridRender, blockRender>>>(dTileOffsets, dTileIndices, tilesX, tileW, tileH);
-    cudaDeviceSynchronize();
 
     // 7) Cleanup temporaries
     cudaFree(dTileCounts);
