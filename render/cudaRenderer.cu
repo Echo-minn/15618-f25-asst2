@@ -646,6 +646,9 @@ __global__ void kernelHistogramTilesFromPairs(const int *pairTileId,
 }
 
 // Render using pre-built CSR bins; preserves order via per-tile sorted indices
+#ifndef BIN_CHUNK
+#define BIN_CHUNK 128
+#endif
 __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
                                          const int *tileIndices,
                                          int tilesNumX,
@@ -663,16 +666,18 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
     int offsetX = tileX * tileW + threadIdx.x;
     int offsetY = tileY * tileH + threadIdx.y;
 
-    if (offsetX >= width || offsetY >= height)
-        return;
-
-    int pixelOffset = 4 * (offsetY * width + offsetX);
-
-    float4 pixelColor = *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]);
-    float r = pixelColor.x;
-    float g = pixelColor.y;
-    float b = pixelColor.z;
-    float a = pixelColor.w;
+    bool inBounds = (offsetX < width) && (offsetY < height);
+    int pixelOffset = 0;
+    float r = 0.f, g = 0.f, b = 0.f, a = 0.f;
+    if (inBounds)
+    {
+        pixelOffset = 4 * (offsetY * width + offsetX);
+        float4 pixelColor = *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]);
+        r = pixelColor.x;
+        g = pixelColor.y;
+        b = pixelColor.z;
+        a = pixelColor.w;
+    }
 
     float invWidth = 1.f / width;
     float invHeight = 1.f / height;
@@ -683,46 +688,72 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
     int begin = tileOffsets[tileId];
     int end = tileOffsets[tileId + 1];
 
-    for (int k = begin; k < end; k++)
+    __shared__ float3 sP[BIN_CHUNK];
+    __shared__ float sRad[BIN_CHUNK];
+    __shared__ int sIdx[BIN_CHUNK];
+
+    int linearThread = threadIdx.y * blockDim.x + threadIdx.x;
+    int threadsPerBlock = blockDim.x * blockDim.y;
+
+    for (int base = begin; base < end; base += BIN_CHUNK)
     {
-        int i = tileIndices[k];
-        int index3 = 3 * i;
-        float3 p = *(float3 *)(&cuConstRendererParams.position[index3]);
-        float rad = cuConstRendererParams.radius[i];
+        int chunkLen = min(BIN_CHUNK, end - base);
 
-        float diffX = p.x - pixelCenterNorm.x;
-        float diffY = p.y - pixelCenterNorm.y;
-        float pixelDist = diffX * diffX + diffY * diffY;
-        float maxDist = rad * rad;
-        if (pixelDist > maxDist)
-            continue;
-
-        float3 rgb;
-        float alpha;
-        if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
+        // Cooperative load of circle parameters into shared memory
+        for (int t = linearThread; t < chunkLen; t += threadsPerBlock)
         {
-            const float kCircleMaxAlpha = .5f;
-            const float falloffScale = 4.f;
-            float normPixelDist = sqrtf(pixelDist) / rad;
-            rgb = lookupColor(normPixelDist);
-            float maxAlpha = .6f + .4f * (1.f - p.z);
-            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-            alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
+            int i = tileIndices[base + t];
+            int index3 = 3 * i;
+            sIdx[t] = i;
+            sP[t] = *(float3 *)(&cuConstRendererParams.position[index3]);
+            sRad[t] = cuConstRendererParams.radius[i];
         }
-        else
-        {
-            rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
-            alpha = .5f;
-        }
+        __syncthreads();
 
-        float oneMinus = 1.f - alpha;
-        r = alpha * rgb.x + oneMinus * r;
-        g = alpha * rgb.y + oneMinus * g;
-        b = alpha * rgb.z + oneMinus * b;
-        a = a + alpha;
+        // Shade against the shared chunk
+        for (int j = 0; j < chunkLen; j++)
+        {
+            float3 p = sP[j];
+            float rad = sRad[j];
+
+            float diffX = p.x - pixelCenterNorm.x;
+            float diffY = p.y - pixelCenterNorm.y;
+            float pixelDist = diffX * diffX + diffY * diffY;
+            float maxDist = rad * rad;
+            if (pixelDist > maxDist)
+                continue;
+
+            float3 rgb;
+            float alpha;
+            if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
+            {
+                const float kCircleMaxAlpha = .5f;
+                const float falloffScale = 4.f;
+                float normPixelDist = sqrtf(pixelDist) / rad;
+                rgb = lookupColor(normPixelDist);
+                float maxAlpha = .6f + .4f * (1.f - p.z);
+                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+                alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
+            }
+            else
+            {
+                int i = sIdx[j];
+                int index3 = 3 * i;
+                rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
+                alpha = .5f;
+            }
+
+            float oneMinus = 1.f - alpha;
+            r = alpha * rgb.x + oneMinus * r;
+            g = alpha * rgb.y + oneMinus * g;
+            b = alpha * rgb.z + oneMinus * b;
+            a = a + alpha;
+        }
+        __syncthreads();
     }
 
-    *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]) = make_float4(r, g, b, a);
+    if (inBounds)
+        *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]) = make_float4(r, g, b, a);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
