@@ -531,8 +531,7 @@ __global__ void kernelRenderPixels()
         g = alpha * rgb.y + oneMinus * g;
         b = alpha * rgb.z + oneMinus * b;
         a = a + alpha;
-        if (a > 0.99f)
-            break;
+        // no early-out to preserve exact accumulation
     }
 
     *(float4 *)(&cuConstRendererParams.imageData[offset]) = make_float4(r, g, b, a);
@@ -714,8 +713,6 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
 
     int threadsPerBlock = blockDim.x * blockDim.y;
     int linearTid = threadIdx.y * blockDim.x + threadIdx.x;
-    bool done = false;
-
     for (int k = begin; k < end; k += batchSize)
     {
         int n = min(batchSize, end - k);
@@ -731,63 +728,45 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
         __syncthreads();
 
         // Shade against the batch
-        if (!done)
+        for (int j = 0; j < n; ++j)
         {
-            for (int j = 0; j < n; ++j)
+            float3 p = sP[j];
+            float rad = sR[j];
+
+            float diffX = p.x - pixelCenterNorm.x;
+            float diffY = p.y - pixelCenterNorm.y;
+            float pixelDist = diffX * diffX + diffY * diffY;
+            float maxDist = rad * rad;
+            if (pixelDist > maxDist)
+                continue;
+
+            float3 rgb;
+            float alpha;
+            if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
             {
-                float3 p = sP[j];
-                float rad = sR[j];
-
-                float diffX = p.x - pixelCenterNorm.x;
-                float diffY = p.y - pixelCenterNorm.y;
-                float pixelDist = diffX * diffX + diffY * diffY;
-                float maxDist = rad * rad;
-                if (pixelDist > maxDist)
-                    continue;
-
-                float3 rgb;
-                float alpha;
-                if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
-                {
-                    const float kCircleMaxAlpha = .5f;
-                    const float falloffScale = 4.f;
-                    float normPixelDist = sqrtf(pixelDist) / rad;
-                    rgb = lookupColor(normPixelDist);
-                    float maxAlpha = .6f + .4f * (1.f - p.z);
-                    maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-                    alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
-                }
-                else
-                {
-                    int dummyIndex3 = 0; // unused, keep identical math to original
-                    rgb = *(float3 *)&(cuConstRendererParams.color[dummyIndex3]);
-                    // Fetch color using p.z as original index was order-correct; keep .5 alpha
-                    // However, since color depends on circle index, reload it here via global read
-                    // Compute circle index from current batch element
-                    int ci = tileIndices[k + j];
-                    dummyIndex3 = 3 * ci;
-                    rgb = *(float3 *)&(cuConstRendererParams.color[dummyIndex3]);
-                    alpha = .5f;
-                }
-
-                float oneMinus = 1.f - alpha;
-                r = alpha * rgb.x + oneMinus * r;
-                g = alpha * rgb.y + oneMinus * g;
-                b = alpha * rgb.z + oneMinus * b;
-                a = a + alpha;
-                if (a > 0.99f)
-                {
-                    done = true;
-                    break;
-                }
+                const float kCircleMaxAlpha = .5f;
+                const float falloffScale = 4.f;
+                float normPixelDist = sqrtf(pixelDist) / rad;
+                rgb = lookupColor(normPixelDist);
+                float maxAlpha = .6f + .4f * (1.f - p.z);
+                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+                alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
             }
+            else
+            {
+                int ci = tileIndices[k + j];
+                int index3 = 3 * ci;
+                rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
+                alpha = .5f;
+            }
+
+            float oneMinus = 1.f - alpha;
+            r = alpha * rgb.x + oneMinus * r;
+            g = alpha * rgb.y + oneMinus * g;
+            b = alpha * rgb.z + oneMinus * b;
+            a = a + alpha;
         }
         __syncthreads();
-        if (done)
-        {
-            // Still must iterate batches to participate in __syncthreads, but no more work
-            continue;
-        }
     }
 
     *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]) = make_float4(r, g, b, a);
