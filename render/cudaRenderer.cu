@@ -325,7 +325,6 @@ __global__ void kernelAdvanceSnowflake()
     *((float3 *)velocityPtr) = velocity;
 }
 
-
 __device__ inline void atomicBlendAssign(float *addr, float alpha, float src)
 {
     int *iaddr = reinterpret_cast<int *>(addr);
@@ -472,12 +471,14 @@ __global__ void kernelRenderPixels()
     int width = cuConstRendererParams.imageWidth;
     int height = cuConstRendererParams.imageHeight;
 
-    if(offsetX >= width || offsetY >= height) {
+    if (offsetX >= width || offsetY >= height)
+    {
         return;
     }
 
-    // read current pixel color
     int offset = 4 * (offsetY * width + offsetX);
+
+    // read current pixel color
     float4 pixelColor = *(float4 *)(&cuConstRendererParams.imageData[offset]);
     float r = pixelColor.x;
     float g = pixelColor.y;
@@ -491,10 +492,12 @@ __global__ void kernelRenderPixels()
         invWidth * (static_cast<float>(offsetX) + 0.5f),
         invHeight * (static_cast<float>(offsetY) + 0.5f));
 
-    int  numCircles = cuConstRendererParams.numberOfCircles;
+    int numCircles = cuConstRendererParams.numberOfCircles;
     // for every circle that contain this pixel
-    for (int i=0; i< numCircles; i++) {
-        float3 p = *(float3 *)(&cuConstRendererParams.position[3*i]);
+    for (int i = 0; i < numCircles; i++)
+    {
+        int index3 = 3 * i;
+        float3 p = *(float3 *)(&cuConstRendererParams.position[index3]);
         float rad = cuConstRendererParams.radius[i];
 
         float diffX = p.x - pixelCenterNorm.x;
@@ -524,7 +527,7 @@ __global__ void kernelRenderPixels()
         else
         {
             // Simple: each circle has an assigned color
-            rgb = *(float3 *)&(cuConstRendererParams.color[3 * i]);
+            rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
             alpha = .5f;
         }
 
@@ -775,7 +778,7 @@ void CudaRenderer::advanceAnimation()
 void CudaRenderer::render()
 {
     // Per-pixel rendering: 16x16 blocks over the image
-    dim3 blockDim(32, 32, 1);
+    dim3 blockDim(16, 16, 1);
     dim3 gridDim(
         (image->width + blockDim.x - 1) / blockDim.x,
         (image->height + blockDim.y - 1) / blockDim.y);
