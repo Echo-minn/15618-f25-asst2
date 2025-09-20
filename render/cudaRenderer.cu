@@ -5,10 +5,18 @@
 #include <stdio.h>
 #include <vector>
 
+#include <thrust/sort.h>
+#include <thrust/device_ptr.h>
+#include <thrust/scan.h>
+#include <thrust/extrema.h>
+#include <thrust/device_vector.h>
+#include <thrust/iterator/counting_iterator.h>
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_functions.h>
 
+#include <sys/time.h>
 #include "cudaRenderer.h"
 #include "image.h"
 #include "noise.h"
@@ -19,14 +27,12 @@
 // All cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
 
-// This stores the global constants
 struct GlobalConstants
 {
 
     SceneName sceneName;
 
     int numberOfCircles;
-
     float *position;
     float *velocity;
     float *color;
@@ -58,7 +64,6 @@ __constant__ float cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
-#include "exclusiveScan.cu_inl"
 
 // kernelClearImageSnowflake -- (CUDA device code)
 //
@@ -326,29 +331,13 @@ __global__ void kernelAdvanceSnowflake()
     *((float3 *)velocityPtr) = velocity;
 }
 
-__device__ inline void atomicBlendAssign(float *addr, float alpha, float src)
-{
-    int *iaddr = reinterpret_cast<int *>(addr);
-    int old = *iaddr;
-    while (true)
-    {
-        float oldf = __int_as_float(old);
-        float newf = alpha * src + (1.f - alpha) * oldf;
-        int newi = __float_as_int(newf);
-        int prev = atomicCAS(iaddr, old, newi);
-        if (prev == old)
-            break;
-        old = prev;
-    }
-}
-
 // shadePixel -- (CUDA device code)
 //
 // Given a pixel and a circle, determine the contribution to the
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(float2 pixelCenter, float3 p, float4 *imagePtr, int circleIndex)
+shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4 *imagePtr)
 {
 
     float diffX = p.x - pixelCenter.x;
@@ -399,12 +388,500 @@ shadePixel(float2 pixelCenter, float3 p, float4 *imagePtr, int circleIndex)
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
 
-    atomicBlendAssign(&(imagePtr->x), alpha, rgb.x);
-    atomicBlendAssign(&(imagePtr->y), alpha, rgb.y);
-    atomicBlendAssign(&(imagePtr->z), alpha, rgb.z);
-    atomicBlendAssign(&(imagePtr->w), alpha, alpha);
+    float4 existingColor = *imagePtr;
+    float4 newColor;
+    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    newColor.w = alpha + existingColor.w;
+
+    // Global memory write
+    *imagePtr = newColor;
 
     // END SHOULD-BE-ATOMIC REGION
+}
+
+// kernelGetCirBinsCount -- (CUDA device code)
+//
+// Each thread counts how many bins there are in a corresponding circle.
+__global__ void kernelGetCirBinsCount(uint *count, uint binPixLength)
+{
+    int circleIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (circleIdx >= cuConstRendererParams.numberOfCircles)
+        return;
+
+    int circleIdx3 = circleIdx * 3;
+    float3 cen = *(float3 *)(&cuConstRendererParams.position[circleIdx3]);
+    float rad = cuConstRendererParams.radius[circleIdx];
+
+    // Get bounding box by pixel index
+    short imgWidth = cuConstRendererParams.imageWidth;
+    short imgHeight = cuConstRendererParams.imageHeight;
+
+    short minX = fminf(fmaxf((cen.x - rad) * imgWidth, 0), imgWidth - 1);
+    short maxX = fminf(fmaxf((cen.x + rad) * imgWidth, 0), imgWidth - 1);
+    short minY = fminf(fmaxf((cen.y - rad) * imgHeight, 0), imgHeight - 1);
+    short maxY = fminf(fmaxf((cen.y + rad) * imgHeight, 0), imgHeight - 1);
+
+    short xbinStart = minX / binPixLength;
+    short xbinEnd = (maxX / binPixLength) + 1;
+    short ybinStart = minY / binPixLength;
+    short ybinEnd = (maxY / binPixLength) + 1;
+
+    count[circleIdx] = static_cast<uint>((xbinEnd - xbinStart) * (ybinEnd - ybinStart));
+}
+
+// kernelGetBin_CirInd -- (CUDA device code)
+//
+// Each thread corresponds to a circle, but it modifies two arrays containing all bins,
+// one for containing circle index and the other with its bin index on the image grid.
+// Seems like repetitive logic, but we needed to know the length beforehand!
+__global__ void kernelGetCirBinsPair(uint *devInputCirIdxStart,
+                                     uint *devOutputBinsCir_Bin,
+                                     uint *devOutputBinsCir_Cir,
+                                     uint binNumLength,
+                                     uint binPixLength)
+{
+    int circleIdx = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (circleIdx >= cuConstRendererParams.numberOfCircles)
+        return;
+
+    int circleIdx3 = circleIdx * 3;
+    float3 cen = *(float3 *)(&cuConstRendererParams.position[circleIdx3]);
+    float rad = cuConstRendererParams.radius[circleIdx];
+
+    // Get bounding box by pixel index
+    short imgWidth = cuConstRendererParams.imageWidth;
+    short imgHeight = cuConstRendererParams.imageHeight;
+
+    short minX = fminf(fmaxf((cen.x - rad) * imgWidth, 0), imgWidth - 1);
+    short maxX = fminf(fmaxf((cen.x + rad) * imgWidth, 0), imgWidth - 1);
+    short minY = fminf(fmaxf((cen.y - rad) * imgHeight, 0), imgHeight - 1);
+    short maxY = fminf(fmaxf((cen.y + rad) * imgHeight, 0), imgHeight - 1);
+
+    short xbinStart = minX / binPixLength;
+    short xbinEnd = (maxX / binPixLength) + 1;
+    short ybinStart = minY / binPixLength;
+    short ybinEnd = (maxY / binPixLength) + 1;
+
+    uint ind = devInputCirIdxStart[circleIdx];
+
+    // Row-major order!
+    for (uint y = ybinStart; y < ybinEnd; y++)
+    {
+        uint binOffset = y * binNumLength;
+        for (uint x = xbinStart; x < xbinEnd; x++)
+        {
+            devOutputBinsCir_Bin[ind] = binOffset + x;
+            devOutputBinsCir_Cir[ind] = circleIdx;
+            ind++;
+        }
+    }
+}
+
+// kernelGetBinStartIndex -- (CUDA device code)
+//
+// For each bin, we want to know its starting index in out array.
+// We can set up shared memory across threads and check if the previous index
+// is different from the current index.
+__global__ void kernelGetBinStartIndex(uint *devOutputBinStartIndex,
+                                       uint *devInputCirBins_Bin,
+                                       uint binsCirLength)
+{
+    __shared__ int cache[257]; // blockDim.x + 1
+
+    int binsCirIdx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (binsCirIdx >= binsCirLength)
+        return;
+
+    if (threadIdx.x == 0)
+    {
+        // Do most common case first for if-else
+        if (binsCirIdx != 0)
+        {
+            cache[0] = devInputCirBins_Bin[binsCirIdx - 1];
+        }
+        else
+        {
+            cache[0] = 0;
+        }
+    }
+    cache[1 + threadIdx.x] = devInputCirBins_Bin[binsCirIdx];
+
+    // ------------------ //
+    __syncthreads(); //
+    // ------------------ //
+
+    int index = cache[1 + threadIdx.x];
+    bool newBin = (index != cache[threadIdx.x]);
+    if (newBin)
+    {
+        // printf("New bin at: %d, %u\n", index, binsCirIdx);
+        devOutputBinStartIndex[index] = binsCirIdx;
+    }
+
+    // ------------------ //
+    __syncthreads(); //
+    // ------------------ //
+
+    if (binsCirIdx == binsCirLength - 1)
+    {
+        newBin = true;
+        binsCirIdx = (int)binsCirLength;
+    }
+
+    if (newBin)
+    {
+        int j = index;
+        while (j > 0 && devOutputBinStartIndex[j] == 0)
+        {
+            devOutputBinStartIndex[j] = (uint)binsCirIdx;
+            j--;
+        }
+    }
+}
+
+// kernelGetBinSizes -- (CUDA device code)
+//
+// Find the size of each bin (how many circles are inside), which is done with
+// pairwise subtraction on the starting indices.
+__global__ void kernelGetBinSizes(uint *devOutputBinSizes,
+                                  uint *devInputBinStartIndex,
+                                  uint binsTotal,
+                                  uint binsCirLength)
+{
+    __shared__ int cache[257]; // blockDim.x + 1
+
+    int binsCirIdx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (binsCirIdx >= binsTotal)
+        return;
+
+    if (threadIdx.x == blockDim.x - 1)
+    {
+        // Do most common case first for if-else
+        if (binsCirIdx != binsTotal - 1)
+        {
+            cache[threadIdx.x + 1] = devInputBinStartIndex[binsCirIdx + 1];
+        }
+    }
+
+    if (binsCirIdx == binsTotal - 1)
+    {
+        cache[1 + threadIdx.x] = binsCirLength;
+    }
+    cache[threadIdx.x] = devInputBinStartIndex[binsCirIdx];
+
+    __syncthreads();
+
+    devOutputBinSizes[binsCirIdx] = cache[1 + threadIdx.x] - cache[threadIdx.x];
+}
+
+// kernelRenderCirclesTRUE -- (CUDA device code)
+//
+// My implementation of rendering circles properly. We need each thread to
+// operate on a grid of pixels since if each thread rendered a circle separately,
+// there is no guarantee of order being preserved.
+//
+__global__ void kernelRenderCirclesTRUE(uint *devCirBins_Cir,
+                                        uint *devBinStartIndex,
+                                        uint binNumLength,
+                                        uint binPixLength,
+                                        uint *devBinNumCir,
+                                        uint maxBinNumCir, bool conditional,
+                                        bool share)
+{
+    // extern keyword since dynamically allocated!
+    extern __shared__ float cache[];
+    float *shareCen = cache;
+    float *shareRad = cache + maxBinNumCir * 3;
+    float *shareCol = shareRad + maxBinNumCir;
+
+    // Find bin from pixel coordinate
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short pixX = blockDim.x * blockIdx.x + threadIdx.x;
+    short pixY = blockDim.y * blockIdx.y + threadIdx.y;
+
+    short binX = pixX / binPixLength;
+    short binY = pixY / binPixLength;
+    short binInd = binY * binNumLength + binX;
+
+    int binStart = devBinStartIndex[binInd];
+    int binSize = devBinNumCir[binInd];
+    short tCount = blockDim.x * blockDim.y;
+    short threadId = threadIdx.y * blockDim.x + threadIdx.x;
+
+    // Move radius and center to shared data
+    if (share)
+        for (int i = threadId; i < binSize; i += tCount)
+        {
+            uint cirIndex = devCirBins_Cir[binStart + i];
+            shareRad[i] = cuConstRendererParams.radius[cirIndex];
+            *(float3 *)(&shareCen[i * 3]) = *(float3 *)(&cuConstRendererParams.position[cirIndex * 3]);
+            *(float3 *)(&shareCol[i * 3]) = *(float3 *)(&cuConstRendererParams.color[cirIndex * 3]);
+        }
+
+    // We do this now after moving stuff to shared data. Otheriwse results are weird!
+    if (pixX >= imageWidth || pixY >= imageHeight)
+    {
+        return;
+    }
+
+    __syncthreads();
+
+    // Move lots of logic from shadePixel into here
+    float4 *imagePtr = (float4 *)(&cuConstRendererParams.imageData[4 * (pixY * imageWidth + pixX)]);
+    float4 newColor = *imagePtr;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float2 pcen = make_float2(invWidth * (static_cast<float>(pixX) + 0.5f),
+                              invHeight * (static_cast<float>(pixY) + 0.5f));
+
+    for (int i = 0; i < binSize; i++)
+    {
+        uint cirIndex = devCirBins_Cir[binStart + i];
+
+        float3 cen = (share) ? *(float3 *)(&shareCen[i * 3]) : *(float3 *)(&cuConstRendererParams.position[cirIndex * 3]);
+        float rad = (share) ? shareRad[i] : cuConstRendererParams.radius[cirIndex];
+        float maxDist = rad * rad;
+
+        float diffX = pcen.x - cen.x;
+        float diffY = pcen.y - cen.y;
+        float pixelDist = diffX * diffX + diffY * diffY;
+
+        // Circle does not contribute to the image
+        if (pixelDist > maxDist)
+        {
+            continue;
+        }
+
+        float3 rgb;
+        float alpha;
+
+        if (conditional)
+        {
+            const float kCircleMaxAlpha = .5f;
+            const float falloffScale = 4.f;
+
+            float normPixelDist = sqrt(pixelDist) / rad;
+            rgb = lookupColor(normPixelDist);
+
+            float maxAlpha = .6f + .4f * (1.f - cen.z);
+            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+        }
+        else
+        {
+            // Simple: each circle has an assigned color
+            rgb = (share) ? *(float3 *)(&shareCol[i * 3]) : *(float3 *)(&cuConstRendererParams.color[cirIndex * 3]);
+            alpha = .5f;
+        }
+
+        float oneMinusAlpha = 1.f - alpha;
+        // draw into to the pixel shared buffer
+        newColor.x = alpha * rgb.x + oneMinusAlpha * newColor.x;
+        newColor.y = alpha * rgb.y + oneMinusAlpha * newColor.y;
+        newColor.z = alpha * rgb.z + oneMinusAlpha * newColor.z;
+        newColor.w = alpha + newColor.w;
+    }
+    *imagePtr = newColor;
+}
+
+// kerneldoesIntersectCircle -- (CUDA device code)
+//
+__global__ void kernelDoesIntersectCircle(int **dev_result, short **box,
+                                          int numCir, int numPix)
+{
+    printf(":D");
+    int indexX = blockDim.x * blockIdx.x + threadIdx.x; // Circle idx
+    int indexY = blockDim.y * blockIdx.y + blockIdx.y;  // Pixel idx
+
+    if (indexX >= numCir || indexY >= numPix)
+        return;
+    short imageWidth = cuConstRendererParams.imageWidth;
+    int pixX = indexY % imageWidth;
+    int pixY = indexY / imageWidth;
+
+    short *bbox = box[indexX];
+    if (pixX >= bbox[0] && pixX <= bbox[1] && pixY >= bbox[2] && pixY <= bbox[3])
+    {
+        float rad = cuConstRendererParams.radius[indexX];
+        float3 p = *(float3 *)(&cuConstRendererParams.position[indexX]);
+
+        short imageWidth = cuConstRendererParams.imageWidth;
+        short imageHeight = cuConstRendererParams.imageHeight;
+
+        float invWidth = 1.f / imageWidth;
+        float invHeight = 1.f / imageHeight;
+        float2 pcen = make_float2(invWidth * (static_cast<float>(pixX) + 0.5f),
+                                  invHeight * (static_cast<float>(pixY) + 0.5f));
+        float maxDist = rad * rad;
+
+        float diffX = pcen.x - p.x;
+        float diffY = pcen.y - p.y;
+        float pixelDist = diffX * diffX + diffY * diffY;
+
+        // Circle does not contribute to the image
+        if (pixelDist <= maxDist)
+        {
+            dev_result[indexY][indexX] = 1;
+            return;
+        }
+    }
+    dev_result[indexY][indexX] = 0;
+}
+
+// kernelRenderCirclesBoxes-- (CUDA device code)
+//
+// Gets the bounding boxes for all circles
+__global__ void kernelRenderCirclesBoxes(int numCir, short **box)
+{
+    int index = blockDim.x * blockIdx.x + threadIdx.x;
+    float3 cen = *(float3 *)(&cuConstRendererParams.position[3 * index]);
+    float rad = cuConstRendererParams.radius[index];
+
+    // Get bounding box by pixel index
+    short imgWidth = cuConstRendererParams.imageWidth;
+    short imgHeight = cuConstRendererParams.imageHeight;
+
+    box[index][0] = fminf(fmaxf((cen.x - rad) * imgWidth, 0), imgWidth - 1);
+    box[index][1] = fminf(fmaxf((cen.x + rad) * imgWidth, 0), imgWidth - 1);
+    box[index][2] = fminf(fmaxf((cen.y - rad) * imgHeight, 0), imgHeight - 1);
+    box[index][3] = fminf(fmaxf((cen.y + rad) * imgHeight, 0), imgHeight - 1);
+    printf("yo");
+}
+
+// kernelRenderCirclesMAYBE-- (CUDA device code)
+//
+// Really naive implementation that does a circle across multiple threads
+// Meant to be sequentially called across all circles.
+__global__ void kernelRenderCirclesMAYBE(int **pointInCircle, int numCir,
+                                         short **box, bool conditional)
+{
+    printf("blah");
+    dim3 blockDim(256, 1);
+    dim3 gridDim((numCir + blockDim.x - 1) / blockDim.x);
+
+    short pixX = blockDim.x * blockIdx.x + threadIdx.x;
+    short pixY = blockDim.y * blockIdx.y + threadIdx.y;
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    if (pixX >= imageWidth || pixY >= imageHeight)
+        return;
+    int pixInd = pixY * imageWidth + pixX;
+    int *isInCircle = pointInCircle[pixInd];
+
+    float4 *imagePtr = (float4 *)(&cuConstRendererParams.imageData[4 * (pixY * imageWidth + pixX)]);
+    float4 newColor = *imagePtr;
+    for (int i = 0; i < numCir; i++)
+    {
+        if (!isInCircle[i])
+            continue;
+        float rad = cuConstRendererParams.radius[i];
+        float3 p = *(float3 *)(&cuConstRendererParams.position[i * 3]);
+        float3 color = *(float3 *)(&cuConstRendererParams.color[i * 3]);
+
+        float3 rgb;
+        float alpha;
+
+        if (conditional)
+        {
+            const float kCircleMaxAlpha = .5f;
+            const float falloffScale = 4.f;
+
+            float diffX = p.x - pixX;
+            float diffY = p.y - pixY;
+            float pixelDist = diffX * diffX + diffY * diffY;
+
+            float normPixelDist = sqrt(pixelDist) / rad;
+            rgb = lookupColor(normPixelDist);
+
+            float maxAlpha = .6f + .4f * (1.f - p.z);
+            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+            alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+        }
+        else
+        {
+            // Simple: each circle has an assigned color
+            rgb = color;
+            alpha = .5f;
+        }
+
+        float oneMinusAlpha = 1.f - alpha;
+        // draw into to the pixel shared buffer
+        newColor.x = alpha * rgb.x + oneMinusAlpha * newColor.x;
+        newColor.y = alpha * rgb.y + oneMinusAlpha * newColor.y;
+        newColor.z = alpha * rgb.z + oneMinusAlpha * newColor.z;
+        newColor.w = alpha + newColor.w;
+    }
+    *imagePtr = newColor;
+}
+
+// kernelRenderCirclesFALSE -- (CUDA device code)
+//
+// Really naive implementation that does a circle across multiple threads
+// Meant to be sequentially called across all circles.
+__global__ void kernelRenderCirclesFALSE(short minX, short minY,
+                                         float3 p, float rad, float3 color,
+                                         bool conditional, int cirIndex)
+{
+    short pixX = blockDim.x * blockIdx.x + threadIdx.x + minX;
+    short pixY = blockDim.y * blockIdx.y + threadIdx.y + minY;
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+
+    float4 *imagePtr = (float4 *)(&cuConstRendererParams.imageData[4 * (pixY * imageWidth + pixX)]);
+    float4 newColor = *imagePtr;
+
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float2 pcen = make_float2(invWidth * (static_cast<float>(pixX) + 0.5f),
+                              invHeight * (static_cast<float>(pixY) + 0.5f));
+    float maxDist = rad * rad;
+
+    float diffX = pcen.x - p.x;
+    float diffY = pcen.y - p.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    // Circle does not contribute to the image
+    if (pixelDist > maxDist)
+    {
+        return;
+    }
+
+    float3 rgb;
+    float alpha;
+
+    if (conditional)
+    {
+        const float kCircleMaxAlpha = .5f;
+        const float falloffScale = 4.f;
+
+        float normPixelDist = sqrt(pixelDist) / rad;
+        rgb = lookupColor(normPixelDist);
+
+        float maxAlpha = .6f + .4f * (1.f - p.z);
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+        alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+    }
+    else
+    {
+        // Simple: each circle has an assigned color
+        rgb = color;
+        alpha = .5f;
+    }
+
+    float oneMinusAlpha = 1.f - alpha;
+    // draw into to the pixel shared buffer
+    newColor.x = alpha * rgb.x + oneMinusAlpha * newColor.x;
+    newColor.y = alpha * rgb.y + oneMinusAlpha * newColor.y;
+    newColor.z = alpha * rgb.z + oneMinusAlpha * newColor.z;
+    newColor.w = alpha + newColor.w;
+
+    *imagePtr = newColor;
 }
 
 // kernelRenderCircles -- (CUDA device code)
@@ -436,15 +913,15 @@ __global__ void kernelRenderCircles()
     short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
 
     // A bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = max(0, min(minX, imageWidth));
-    short screenMaxX = max(0, min(maxX, imageWidth));
-    short screenMinY = max(0, min(minY, imageHeight));
-    short screenMaxY = max(0, min(maxY, imageHeight));
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
 
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
 
-    // For all pixels in the bounding box
+    // For all pixels in the bonding box
     for (int pixelY = screenMinY; pixelY < screenMaxY; pixelY++)
     {
         float4 *imgPtr = (float4 *)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
@@ -452,297 +929,10 @@ __global__ void kernelRenderCircles()
         {
             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(pixelCenterNorm, p, imgPtr, index);
+            shadePixel(index, pixelCenterNorm, p, imgPtr);
             imgPtr++;
         }
     }
-}
-
-// kernelRenderPixels -- (CUDA device code)
-//
-// Each thread shades one pixel by looping over all circles in input order.
-// This preserves per-pixel ordering and avoids atomics because a single
-// thread owns the pixel's full read-modify-write sequence.
-__global__ void kernelRenderPixels()
-{
-
-    int offsetX = blockIdx.x * blockDim.x + threadIdx.x;
-    int offsetY = blockIdx.y * blockDim.y + threadIdx.y;
-
-    int width = cuConstRendererParams.imageWidth;
-    int height = cuConstRendererParams.imageHeight;
-
-    if (offsetX >= width || offsetY >= height)
-        return;
-
-    int offset = 4 * (offsetY * width + offsetX);
-
-    // read current pixel color
-    float4 pixelColor = *(float4 *)(&cuConstRendererParams.imageData[offset]);
-    float r = pixelColor.x;
-    float g = pixelColor.y;
-    float b = pixelColor.z;
-    float a = pixelColor.w;
-
-    // Pixel center in normalized coordinates
-    float invWidth = 1.f / width;
-    float invHeight = 1.f / height;
-    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(offsetX) + 0.5f),
-                                         invHeight * (static_cast<float>(offsetY) + 0.5f));
-
-    // for every circle that contain this pixel
-    int numCircles = cuConstRendererParams.numberOfCircles;
-    for (int i = 0; i < numCircles; i++)
-    {
-        int index3 = 3 * i;
-        float3 p = *(float3 *)(&cuConstRendererParams.position[index3]);
-        float rad = cuConstRendererParams.radius[i];
-
-        float diffX = p.x - pixelCenterNorm.x;
-        float diffY = p.y - pixelCenterNorm.y;
-        float pixelDist = diffX * diffX + diffY * diffY;
-        float maxDist = rad * rad;
-
-        // Circle does not contribute to the image
-        if (pixelDist > maxDist)
-            continue;
-
-        // Shade: compute rgb and alpha for this circle at this pixel
-        float3 rgb;
-        float alpha;
-        if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
-        {
-            const float kCircleMaxAlpha = .5f;
-            const float falloffScale = 4.f;
-            float normPixelDist = sqrtf(pixelDist) / rad;
-            rgb = lookupColor(normPixelDist);
-            float maxAlpha = .6f + .4f * (1.f - p.z);
-            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-            alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
-        }
-        else
-        {
-            rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
-            alpha = .5f;
-        }
-
-        // In-order blend into this pixel (local registers)
-        float oneMinus = 1.f - alpha;
-        r = alpha * rgb.x + oneMinus * r;
-        g = alpha * rgb.y + oneMinus * g;
-        b = alpha * rgb.z + oneMinus * b;
-        a = a + alpha;
-    }
-
-    *(float4 *)(&cuConstRendererParams.imageData[offset]) = make_float4(r, g, b, a);
-}
-
-////////////////////////////////////////////////////////////////////////////////////////
-// GPU binning (no Thrust): count -> host scan -> fill -> per-tile serial sort
-////////////////////////////////////////////////////////////////////////////////////////
-
-// Device globals for bin metadata
-__device__ int *gTileOffsets = NULL;
-__device__ int *gTileIndices = NULL;
-__device__ int gTilesNumX = 0;
-__device__ int gTilesNumY = 0;
-__device__ int gTileWidth = 0;
-__device__ int gTileHeight = 0;
-__device__ int gBinsEnabledInt = 0; // 0 = off, 1 = on
-
-// Count how many times each tile is overlapped by all circles
-__global__ void kernelCountTileMembership(const float *position,
-                                          const float *radius,
-                                          int numCircles,
-                                          int imageWidth,
-                                          int imageHeight,
-                                          int tilesX,
-                                          int tilesY,
-                                          int tileW,
-                                          int tileH,
-                                          int *tileCounts)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= numCircles)
-        return;
-
-    float cx = position[3 * i + 0];
-    float cy = position[3 * i + 1];
-    float r = radius[i];
-
-    int minPx = max(0, (int)floorf((cx - r) * imageWidth));
-    int maxPx = min(imageWidth - 1, (int)floorf((cx + r) * imageWidth));
-    int minPy = max(0, (int)floorf((cy - r) * imageHeight));
-    int maxPy = min(imageHeight - 1, (int)floorf((cy + r) * imageHeight));
-
-    int minTx = minPx / tileW;
-    int maxTx = maxPx / tileW;
-    int minTy = minPy / tileH;
-    int maxTy = maxPy / tileH;
-    minTx = max(0, min(minTx, tilesX - 1));
-    maxTx = max(0, min(maxTx, tilesX - 1));
-    minTy = max(0, min(minTy, tilesY - 1));
-    maxTy = max(0, min(maxTy, tilesY - 1));
-
-    for (int ty = minTy; ty <= maxTy; ty++)
-    {
-        for (int tx = minTx; tx <= maxTx; tx++)
-        {
-            int tileId = ty * tilesX + tx;
-            atomicAdd(&tileCounts[tileId], 1);
-        }
-    }
-}
-
-// Fill tileIndices using atomics into each tile segment (order to be fixed later)
-__global__ void kernelFillTileMembership(const float *position,
-                                         const float *radius,
-                                         int numCircles,
-                                         int imageWidth,
-                                         int imageHeight,
-                                         int tilesX,
-                                         int tilesY,
-                                         int tileW,
-                                         int tileH,
-                                         int *tileWriteHeads,
-                                         const int *tileOffsets,
-                                         int *tileIndices)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= numCircles)
-        return;
-
-    float cx = position[3 * i + 0];
-    float cy = position[3 * i + 1];
-    float r = radius[i];
-
-    int minPx = max(0, (int)floorf((cx - r) * imageWidth));
-    int maxPx = min(imageWidth - 1, (int)floorf((cx + r) * imageWidth));
-    int minPy = max(0, (int)floorf((cy - r) * imageHeight));
-    int maxPy = min(imageHeight - 1, (int)floorf((cy + r) * imageHeight));
-
-    int minTx = minPx / tileW;
-    int maxTx = maxPx / tileW;
-    int minTy = minPy / tileH;
-    int maxTy = maxPy / tileH;
-    minTx = max(0, min(minTx, tilesX - 1));
-    maxTx = max(0, min(maxTx, tilesX - 1));
-    minTy = max(0, min(minTy, tilesY - 1));
-    maxTy = max(0, min(maxTy, tilesY - 1));
-
-    for (int ty = minTy; ty <= maxTy; ty++)
-    {
-        for (int tx = minTx; tx <= maxTx; tx++)
-        {
-            int tileId = ty * tilesX + tx;
-            int idx = atomicAdd(&tileWriteHeads[tileId], 1);
-            tileIndices[tileOffsets[tileId] + idx] = i;
-        }
-    }
-}
-
-// Serial insertion sort per tile segment to restore ascending circle index order
-__global__ void kernelSortTileSegments(const int *tileOffsets,
-                                       const int *tileCounts,
-                                       int numTiles,
-                                       int *tileIndices)
-{
-    int tileId = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tileId >= numTiles)
-        return;
-
-    int start = tileOffsets[tileId];
-    int len = tileCounts[tileId];
-    // Insertion sort in-place
-    for (int j = 1; j < len; j++)
-    {
-        int key = tileIndices[start + j];
-        int k = j - 1;
-        while (k >= 0 && tileIndices[start + k] > key)
-        {
-            tileIndices[start + k + 1] = tileIndices[start + k];
-            k--;
-        }
-        tileIndices[start + k + 1] = key;
-    }
-}
-
-// Render using pre-built CSR bins; preserves order via per-tile sorted indices
-__global__ void kernelRenderPixelsBinned(const int *tileOffsets,
-                                         const int *tileIndices,
-                                         int tilesNumX,
-                                         int tileW,
-                                         int tileH)
-{
-
-    int offsetX = blockIdx.x * blockDim.x + threadIdx.x;
-    int offsetY = blockIdx.y * blockDim.y + threadIdx.y;
-
-    int width = cuConstRendererParams.imageWidth;
-    int height = cuConstRendererParams.imageHeight;
-
-    if (offsetX >= width || offsetY >= height)
-        return;
-
-    int pixelOffset = 4 * (offsetY * width + offsetX);
-
-    float4 pixelColor = *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]);
-    float r = pixelColor.x;
-    float g = pixelColor.y;
-    float b = pixelColor.z;
-    float a = pixelColor.w;
-
-    float invWidth = 1.f / width;
-    float invHeight = 1.f / height;
-    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(offsetX) + 0.5f),
-                                         invHeight * (static_cast<float>(offsetY) + 0.5f));
-
-    int tileX = offsetX / tileW;
-    int tileY = offsetY / tileH;
-    int tileId = tileY * tilesNumX + tileX;
-    int begin = tileOffsets[tileId];
-    int end = tileOffsets[tileId + 1];
-
-    for (int k = begin; k < end; k++)
-    {
-        int i = tileIndices[k];
-        int index3 = 3 * i;
-        float3 p = *(float3 *)(&cuConstRendererParams.position[index3]);
-        float rad = cuConstRendererParams.radius[i];
-
-        float diffX = p.x - pixelCenterNorm.x;
-        float diffY = p.y - pixelCenterNorm.y;
-        float pixelDist = diffX * diffX + diffY * diffY;
-        float maxDist = rad * rad;
-        if (pixelDist > maxDist)
-            continue;
-
-        float3 rgb;
-        float alpha;
-        if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
-        {
-            const float kCircleMaxAlpha = .5f;
-            const float falloffScale = 4.f;
-            float normPixelDist = sqrtf(pixelDist) / rad;
-            rgb = lookupColor(normPixelDist);
-            float maxAlpha = .6f + .4f * (1.f - p.z);
-            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-            alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
-        }
-        else
-        {
-            rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
-            alpha = .5f;
-        }
-
-        float oneMinus = 1.f - alpha;
-        r = alpha * rgb.x + oneMinus * r;
-        g = alpha * rgb.y + oneMinus * g;
-        b = alpha * rgb.z + oneMinus * b;
-        a = a + alpha;
-    }
-
-    *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]) = make_float4(r, g, b, a);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -787,6 +977,12 @@ CudaRenderer::~CudaRenderer()
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
+
+        cudaFree(devPointInCircle);
+        cudaFree(devCirBinsCount);
+        cudaFree(devCirBinsIndex);
+        cudaFree(devBinStartIndex);
+        cudaFree(devBinNumCir);
     }
 }
 
@@ -855,6 +1051,38 @@ void CudaRenderer::setup()
     //
     // See the CUDA Programmer's Guide for descriptions of
     // cudaMalloc and cudaMemcpy
+
+    /** Setup code for new approach! */
+    // We want more bins if there are more circles, but we also want them to be aligned
+    // with 16x16 grids when running renderCircles.
+    //
+    if (numberOfCircles < 100)
+    {
+        binNumLength = 4;
+    }
+    else if (numberOfCircles >= 100 && numberOfCircles < 1000)
+    {
+        binNumLength = 8;
+    }
+    else if (numberOfCircles >= 1000 && numberOfCircles < 10000)
+    {
+        binNumLength = 16;
+    }
+    else
+    {
+        binNumLength = 64;
+    }
+
+    uint notBinPixLength = (image->width - 1) / binNumLength + 1; // standard
+    binPixLength = max(1, (notBinPixLength / 16)) * 16;           // push to floor multiple of 16
+    binNumLength = (image->width - 1) / binPixLength + 1;         // correct binNumLength
+
+    // allocate memory for cuda
+    cudaMalloc(&devPointInCircle, sizeof(uint) * image->width * image->height);
+    cudaMalloc(&devCirBinsCount, sizeof(uint) * numberOfCircles);
+    cudaMalloc(&devCirBinsIndex, sizeof(uint) * numberOfCircles);
+    cudaMalloc(&devBinStartIndex, sizeof(uint) * binNumLength * binNumLength);
+    cudaMalloc(&devBinNumCir, sizeof(uint) * binNumLength * binNumLength);
 
     cudaMalloc(&cudaDevicePosition, sizeof(float) * 3 * numberOfCircles);
     cudaMalloc(&cudaDeviceVelocity, sizeof(float) * 3 * numberOfCircles);
@@ -980,81 +1208,173 @@ void CudaRenderer::advanceAnimation()
 
 void CudaRenderer::render()
 {
-    // Per-pixel rendering: 16x16 blocks over the image
-    // dim3 blockDim(32, 32, 1);
-    // dim3 gridDim(
-    //     (image->width + blockDim.x - 1) / blockDim.x,
-    //     (image->height + blockDim.y - 1) / blockDim.y);
+    // 256 threads per block is a healthy number
+    bool conditional = (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME);
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &start);
 
-    // kernelRenderPixels<<<gridDim, blockDim>>>();
-    // cudaDeviceSynchronize();
+    dim3 blockDim(256, 1);
+    dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
 
-    // Tiled, order-correct rendering using CSR bins (built each frame)
+    /** Step 1: Get number of bins per circle
+     */
+    kernelGetCirBinsCount<<<gridDim, blockDim>>>(devCirBinsCount, binPixLength);
 
-    // 1) Compute tile grid
-    const int tileW = 32;
-    const int tileH = 32;
-    const int tilesX = (image->width + tileW - 1) / tileW;
-    const int tilesY = (image->height + tileH - 1) / tileH;
-    const int numTiles = tilesX * tilesY;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+    uint delta_us = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
+    printf("Time: %u\n", delta_us);
 
-    // 2) Count tile membership per tile
-    int *dTileCounts = NULL;
-    cudaMalloc(&dTileCounts, sizeof(int) * numTiles);
-    cudaMemset(dTileCounts, 0, sizeof(int) * numTiles);
+    /** step 1.5: If we have reason to believe that the graph has really low density,
+                  then we switch approach. This is either from having a very small
+                  amount of circles, or a sparse pattern.
+                  We can tell by checking how many circles are in each bin.
+    */
+    if (numberOfCircles < 5)
+    {
+        for (int i = 0; i < numberOfCircles; i++)
+        {
+            float3 p = *(float3 *)(&position[i * 3]);
+            float rad = radius[i];
+            float3 col = *(float3 *)(&color[i * 3]);
 
-    dim3 blockCount(256, 1, 1);
-    dim3 gridCount((numberOfCircles + blockCount.x - 1) / blockCount.x, 1, 1);
-    kernelCountTileMembership<<<gridCount, blockCount>>>(
-        cudaDevicePosition, cudaDeviceRadius, numberOfCircles,
-        image->width, image->height,
-        tilesX, tilesY, tileW, tileH,
-        dTileCounts);
+            int imgWidth = image->width;
+            int imgHeight = image->height;
+            int minX = fminf(fmaxf((p.x - rad) * imgWidth, 0), imgWidth - 1);
+            int maxX = fminf(fmaxf((p.x + rad) * imgWidth, 0), imgWidth - 1);
+            int minY = fminf(fmaxf((p.y - rad) * imgHeight, 0), imgHeight - 1);
+            int maxY = fminf(fmaxf((p.y + rad) * imgHeight, 0), imgHeight - 1);
+            printf("%d, %d | %d, %d\n", minX, maxX, minY, maxY);
+
+            dim3 pixelBlockDim(16, 16);
+            dim3 pixelGridDim((maxX - minX) / pixelBlockDim.x + 1,
+                              (maxY - minY) / pixelBlockDim.y + 1);
+            kernelRenderCirclesFALSE<<<pixelGridDim, pixelBlockDim>>>(minX, minY,
+                                                                      p, rad,
+                                                                      col, conditional, i);
+            cudaDeviceSynchronize();
+        }
+        return;
+    }
+
+    /** Step 2: Get starting index of the bins per circle
+                Done by using thrust::exclusive_scan (sorry!)
+    */
+    thrust::exclusive_scan(thrust::device_ptr<uint>(devCirBinsCount),
+                           thrust::device_ptr<uint>(devCirBinsCount + numberOfCircles),
+                           thrust::device_ptr<uint>(devCirBinsIndex));
+
+    clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+    delta_us = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
+    printf("Time: %u\n", delta_us);
+
+    // Get how many bin-circle pairs there are
+    uint lastCirBinsCount, lastCirBinsIndex;
+    cudaMemcpy(&lastCirBinsCount, devCirBinsCount + numberOfCircles - 1,
+               sizeof(uint), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&lastCirBinsIndex, devCirBinsIndex + numberOfCircles - 1,
+               sizeof(uint), cudaMemcpyDeviceToHost);
+    uint cirBinsLength = lastCirBinsCount + lastCirBinsIndex;
+
+    /** Step 3: Bind each bin with its circle and relative index within its circle
+     *      4: Sort by bin index (using thrust::stable_sort to preserve circle
+     *         order)
+     */
+    uint *devCirBins_Bin, *devCirBins_Cir;
+    cudaMalloc(&devCirBins_Bin, sizeof(uint) * cirBinsLength);
+    cudaMalloc(&devCirBins_Cir, sizeof(uint) * cirBinsLength);
+    kernelGetCirBinsPair<<<gridDim, blockDim>>>(devCirBinsIndex,
+                                                devCirBins_Bin, devCirBins_Cir,
+                                                binNumLength, binPixLength);
+
+    clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+    delta_us = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
+    printf("Time: %u\n", delta_us);
+
+    thrust::stable_sort_by_key(thrust::device_ptr<uint>(devCirBins_Bin),
+                               thrust::device_ptr<uint>(devCirBins_Bin + cirBinsLength),
+                               thrust::device_ptr<uint>(devCirBins_Cir));
+
+    clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+    delta_us = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
+    printf("Time: %u\n", delta_us);
+
+    /** Now that we have all the bins in order with circle order preserved, we
+     * can do each bin in parallel!
+     *
+     * Step 5: Find the starting index of each bin and how many circles are in there
+     */
+    printf("Step 5\n");
+    // Still use 256 threads per block
+    uint numBins = binNumLength * binNumLength;
+    dim3 cirBinsGridDim((cirBinsLength + blockDim.x - 1) / blockDim.x);
+    kernelGetBinStartIndex<<<cirBinsGridDim, blockDim>>>(devBinStartIndex,
+                                                         devCirBins_Bin,
+                                                         cirBinsLength);
+
+    clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+    delta_us = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
+    printf("Time: %u\n", delta_us);
+
+    cudaMemset(devBinStartIndex, 0, sizeof(uint));
+    dim3 binsGridDim((numBins + blockDim.x - 1) / blockDim.x);
+    kernelGetBinSizes<<<binsGridDim, blockDim>>>(devBinNumCir,
+                                                 devBinStartIndex,
+                                                 numBins,
+                                                 cirBinsLength);
+
+    clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+    delta_us = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
+    printf("Time: %u\n", delta_us);
+
+    thrust::device_ptr<uint> result = thrust::max_element(thrust::device_ptr<uint>(devBinNumCir),
+                                                          thrust::device_ptr<uint>(devBinNumCir + numBins));
+
+    clock_gettime(CLOCK_MONOTONIC_RAW, &end);
+    delta_us = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
+    printf("Time: %u\n", delta_us);
+
+    uint maxBinNumCir = result[0];
+
+    /** Step 6: Finally render the circles, with each block of pixels being drawn
+     *         on a separate thread.
+     */
+    // printf("Step 6, %d\n", maxBinNumCir);
+    dim3 pixelBlockDim(16, 16);
+    dim3 pixelGridDim((image->width - 1) / pixelBlockDim.x + 1,
+                      (image->height - 1) / pixelBlockDim.y + 1);
+
+    if (maxBinNumCir < 1000)
+    {
+        uint sharedMemSize = maxBinNumCir * (7 * sizeof(float));
+        // 3 for center coordinates
+        // 1 for radius
+        // printf("%d\n", sharedMemSize);             //3 for color
+        kernelRenderCirclesTRUE<<<pixelGridDim, pixelBlockDim,
+                                  sharedMemSize>>>(devCirBins_Cir,
+                                                   devBinStartIndex,
+                                                   binNumLength,
+                                                   binPixLength,
+                                                   devBinNumCir,
+                                                   maxBinNumCir,
+                                                   conditional,
+                                                   true);
+    }
+    else
+    {
+        // Too much memory to share across threads!!!
+        kernelRenderCirclesTRUE<<<pixelGridDim, pixelBlockDim>>>(devCirBins_Cir,
+                                                                 devBinStartIndex,
+                                                                 binNumLength,
+                                                                 binPixLength,
+                                                                 devBinNumCir,
+                                                                 maxBinNumCir,
+                                                                 conditional,
+                                                                 false);
+    }
+
+    // Initial solution given (BAD!)
+    // kernelRenderCircles<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
-
-    // 3) Build CSR offsets on host
-    std::vector<int> hCounts(numTiles);
-    cudaMemcpy(hCounts.data(), dTileCounts, sizeof(int) * numTiles, cudaMemcpyDeviceToHost);
-    std::vector<int> hOffsets(numTiles + 1);
-    hOffsets[0] = 0;
-    for (int t = 0; t < numTiles; t++)
-        hOffsets[t + 1] = hOffsets[t] + hCounts[t];
-    int totalMembership = hOffsets[numTiles];
-
-    // 4) Allocate CSR device buffers and fill indices (unordered)
-    int *dTileOffsets = NULL;
-    int *dTileIndices = NULL;
-    int *dTileWriteHeads = NULL;
-    cudaMalloc(&dTileOffsets, sizeof(int) * (numTiles + 1));
-    cudaMemcpy(dTileOffsets, hOffsets.data(), sizeof(int) * (numTiles + 1), cudaMemcpyHostToDevice);
-    cudaMalloc(&dTileIndices, sizeof(int) * totalMembership);
-    cudaMalloc(&dTileWriteHeads, sizeof(int) * numTiles);
-    cudaMemset(dTileWriteHeads, 0, sizeof(int) * numTiles);
-
-    kernelFillTileMembership<<<gridCount, blockCount>>>(
-        cudaDevicePosition, cudaDeviceRadius, numberOfCircles,
-        image->width, image->height,
-        tilesX, tilesY, tileW, tileH,
-        dTileWriteHeads, dTileOffsets, dTileIndices);
-    cudaDeviceSynchronize();
-
-    // 5) Sort each tile segment by circle index to restore input order
-    dim3 blockSort(256, 1, 1);
-    dim3 gridSort((numTiles + blockSort.x - 1) / blockSort.x, 1, 1);
-    kernelSortTileSegments<<<gridSort, blockSort>>>(dTileOffsets, dTileCounts, numTiles, dTileIndices);
-    cudaDeviceSynchronize();
-
-    // 6) Render per pixel using binned CSR lists
-    dim3 blockRender(32, 32, 1);
-    dim3 gridRender(
-        (image->width + blockRender.x - 1) / blockRender.x,
-        (image->height + blockRender.y - 1) / blockRender.y);
-    kernelRenderPixelsBinned<<<gridRender, blockRender>>>(dTileOffsets, dTileIndices, tilesX, tileW, tileH);
-    cudaDeviceSynchronize();
-
-    // 7) Cleanup temporaries
-    cudaFree(dTileCounts);
-    cudaFree(dTileOffsets);
-    cudaFree(dTileIndices);
-    cudaFree(dTileWriteHeads);
+    cudaFree(devCirBins_Bin);
+    cudaFree(devCirBins_Cir);
 }
