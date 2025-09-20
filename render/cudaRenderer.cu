@@ -465,31 +465,31 @@ __global__ void kernelRenderCircles()
 __global__ void kernelRenderPixels()
 {
 
-    int imageX = blockIdx.x * blockDim.x + threadIdx.x;
-    int imageY = blockIdx.y * blockDim.y + threadIdx.y;
+    int offsetX = blockIdx.x * blockDim.x + threadIdx.x;
+    int offsetY = blockIdx.y * blockDim.y + threadIdx.y;
 
     int width = cuConstRendererParams.imageWidth;
     int height = cuConstRendererParams.imageHeight;
 
-    if (imageX >= width || imageY >= height)
+    if (offsetX >= width || offsetY >= height)
         return;
 
-    int offset = 4 * (imageY * width + imageX);
+    int offset = 4 * (offsetY * width + offsetX);
 
-    // Load current pixel color (cleared previously)
-    float4 accum = *(float4 *)(&cuConstRendererParams.imageData[offset]);
-    float r = accum.x;
-    float g = accum.y;
-    float b = accum.z;
-    float a = accum.w;
+    // read current pixel color
+    float4 pixelColor = *(float4 *)(&cuConstRendererParams.imageData[offset]);
+    float r = pixelColor.x;
+    float g = pixelColor.y;
+    float b = pixelColor.z;
+    float a = pixelColor.w;
 
     // Pixel center in normalized coordinates
     float invWidth = 1.f / width;
     float invHeight = 1.f / height;
-    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(imageX) + 0.5f),
-                                         invHeight * (static_cast<float>(imageY) + 0.5f));
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(offsetX) + 0.5f),
+                                         invHeight * (static_cast<float>(offsetY) + 0.5f));
 
-    // Loop over circles in input order
+    // for every circle that contain this pixel
     int numCircles = cuConstRendererParams.numberOfCircles;
     for (int i = 0; i < numCircles; i++)
     {
@@ -497,11 +497,12 @@ __global__ void kernelRenderPixels()
         float3 p = *(float3 *)(&cuConstRendererParams.position[index3]);
         float rad = cuConstRendererParams.radius[i];
 
-        // Quick reject
         float diffX = p.x - pixelCenterNorm.x;
         float diffY = p.y - pixelCenterNorm.y;
         float pixelDist = diffX * diffX + diffY * diffY;
         float maxDist = rad * rad;
+
+        // Circle does not contribute to the image
         if (pixelDist > maxDist)
             continue;
 
