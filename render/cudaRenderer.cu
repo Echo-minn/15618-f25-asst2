@@ -695,16 +695,21 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
     int offsetX = tileX * tileW + threadIdx.x;
     int offsetY = tileY * tileH + threadIdx.y;
 
-    if (offsetX >= width || offsetY >= height)
-        return;
+    // Edge tiles may have out-of-bounds threads; they must still participate
+    // in __syncthreads() to avoid deadlock. Guard all memory I/O with inBounds.
+    bool inBounds = (offsetX < width) && (offsetY < height);
+    int pixelOffset = inBounds ? (4 * (offsetY * width + offsetX)) : 0;
 
-    int pixelOffset = 4 * (offsetY * width + offsetX);
-
-    float4 pixelColor = *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]);
-    float r = pixelColor.x;
-    float g = pixelColor.y;
-    float b = pixelColor.z;
-    float a = pixelColor.w;
+    float r = 0.f, g = 0.f, b = 0.f, a = 0.f;
+    float4 pixelColor;
+    if (inBounds)
+    {
+        pixelColor = *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]);
+        r = pixelColor.x;
+        g = pixelColor.y;
+        b = pixelColor.z;
+        a = pixelColor.w;
+    }
 
     float invWidth = 1.f / width;
     float invHeight = 1.f / height;
@@ -739,44 +744,48 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
         // Consume cached batch
         for (int b = 0; b < batchSize; b++)
         {
-            float3 p = sPos[b];
-            float rad = sRad[b];
-
-            float diffX = p.x - pixelCenterNorm.x;
-            float diffY = p.y - pixelCenterNorm.y;
-            float pixelDist = diffX * diffX + diffY * diffY;
-            float maxDist = rad * rad;
-            if (pixelDist > maxDist)
-                continue;
-
-            float3 rgb;
-            float alpha;
-            if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
+            if (inBounds)
             {
-                const float kCircleMaxAlpha = .5f;
-                const float falloffScale = 4.f;
-                float normPixelDist = sqrtf(pixelDist) / rad;
-                rgb = lookupColor(normPixelDist);
-                float maxAlpha = .6f + .4f * (1.f - p.z);
-                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-                alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
-            }
-            else
-            {
-                rgb = sCol[b];
-                alpha = .5f;
-            }
+                float3 p = sPos[b];
+                float rad = sRad[b];
 
-            float oneMinus = 1.f - alpha;
-            r = alpha * rgb.x + oneMinus * r;
-            g = alpha * rgb.y + oneMinus * g;
-            b = alpha * rgb.z + oneMinus * b;
-            a = a + alpha;
+                float diffX = p.x - pixelCenterNorm.x;
+                float diffY = p.y - pixelCenterNorm.y;
+                float pixelDist = diffX * diffX + diffY * diffY;
+                float maxDist = rad * rad;
+                if (pixelDist > maxDist)
+                    continue;
+
+                float3 rgb;
+                float alpha;
+                if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
+                {
+                    const float kCircleMaxAlpha = .5f;
+                    const float falloffScale = 4.f;
+                    float normPixelDist = sqrtf(pixelDist) / rad;
+                    rgb = lookupColor(normPixelDist);
+                    float maxAlpha = .6f + .4f * (1.f - p.z);
+                    maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+                    alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
+                }
+                else
+                {
+                    rgb = sCol[b];
+                    alpha = .5f;
+                }
+
+                float oneMinus = 1.f - alpha;
+                r = alpha * rgb.x + oneMinus * r;
+                g = alpha * rgb.y + oneMinus * g;
+                b = alpha * rgb.z + oneMinus * b;
+                a = a + alpha;
+            }
         }
         __syncthreads();
     }
 
-    *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]) = make_float4(r, g, b, a);
+    if (inBounds)
+        *(float4 *)(&cuConstRendererParams.imageData[pixelOffset]) = make_float4(r, g, b, a);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
