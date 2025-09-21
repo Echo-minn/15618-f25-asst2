@@ -537,7 +537,7 @@ __global__ void kernelRenderPixels()
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
-// GPU binning (no Thrust): count -> host scan -> fill -> per-tile serial sort
+// GPU binning: count -> host scan -> fill -> per-tile serial sort
 ////////////////////////////////////////////////////////////////////////////////////////
 
 // Count tiles overlapped per circle (rectangle of tiles bounding the circle)
@@ -590,9 +590,9 @@ __global__ void kernelWriteCircleTilePairs(const float *position,
                                            int tilesY,
                                            int tileW,
                                            int tileH,
-                                           const int *circleBase,
-                                           int *pairTileId,
-                                           int *pairCircleIdx)
+                                           const int *circleBase, // An array where circleBase[i] gives the starting index in the output arrays for the i-th circle's tile pairs.
+                                           int *pairTileId, // Output array to store the tile ID for each (tile, circle) pair that the circle overlaps.
+                                           int *pairCircleIdx) // Output array to store the circle index for each (tile, circle) pair; aligns with pairTileId.
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= numCircles)
@@ -602,6 +602,9 @@ __global__ void kernelWriteCircleTilePairs(const float *position,
     float cy = position[3 * i + 1];
     float r = radius[i];
 
+    // pixel coordinate range covered by the circle.
+    // recover normalized [0,1] coordinates.
+    // TODO: why normalized coordinates
     int minPx = max(0, (int)floorf((cx - r) * imageWidth));
     int maxPx = min(imageWidth - 1, (int)floorf((cx + r) * imageWidth));
     int minPy = max(0, (int)floorf((cy - r) * imageHeight));
@@ -617,47 +620,51 @@ __global__ void kernelWriteCircleTilePairs(const float *position,
     maxTy = max(0, min(maxTy, tilesY - 1));
 
     int base = circleBase[i];
-    int w = 0;
+    int pairOffset = 0;
     for (int ty = minTy; ty <= maxTy; ty++)
     {
         for (int tx = minTx; tx <= maxTx; tx++)
         {
             int tileId = ty * tilesX + tx;
-            int k = base + w;
-            pairTileId[k] = tileId;
-            pairCircleIdx[k] = i;
-            w++;
+            // k is the global index in the output arrays for the (tile, circle) pair.
+            // It is computed as the base offset for this circle plus the current offset w.
+            int pairIdx = base + pairOffset;
+            pairTileId[pairIdx] = tileId;
+            pairCircleIdx[pairIdx] = i;
+            pairOffset++;
         }
     }
 }
 
 // Histogram tiles from pairs (one thread per pair entry)
 __global__ void kernelHistogramTilesFromPairs(const int *pairTileId,
-                                              int totalMembership,
+                                              int totalPairs, // The total number of (tile, circle) pairs
                                               int numTiles,
                                               int *tileCounts)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= totalMembership)
+    if (k >= totalPairs)
         return;
     int tileId = pairTileId[k];
     if (tileId >= 0 && tileId < numTiles)
         atomicAdd(&tileCounts[tileId], 1);
 }
 
-// Device-side stable counting sort by tiles using waves (buckets of K entries)
+// Device-side stable counting sort by tiles using "waves" (waves are contiguous blocks of K entries, i.e., each wave processes up to waveSize pairs)
 // 1) Count tiles per wave into waveCounts[m][tile]
+//    - Here, a "wave" refers to a chunk of up to waveSize consecutive (tile, circle) pairs.
+//    - Each block processes one wave (i.e., a range of indices [m*waveSize, (m+1)*waveSize)), allowing the sort to be performed in manageable batches.
 __global__ void kernelCountTilesPerWave(const int *pairTileId,
-                                        int totalMembership,
+                                        int totalPairs,
                                         int numTiles,
                                         int waveSize,
                                         int *waveCounts)
 {
     int m = blockIdx.x;
     int waveStart = m * waveSize;
-    if (waveStart >= totalMembership)
+    if (waveStart >= totalPairs)
         return;
-    int waveEnd = min(waveStart + waveSize, totalMembership);
+    int waveEnd = min(waveStart + waveSize, totalPairs);
 
     extern __shared__ int sCounts[]; // size = numTiles
     for (int t = threadIdx.x; t < numTiles; t += blockDim.x)
@@ -697,7 +704,7 @@ __global__ void kernelExclusiveScanWaveCounts(const int *waveCounts,
 // 3) Stable scatter within each wave using wave-local heads, preserving pair order
 __global__ void kernelScatterWaveStable(const int *pairTileId,
                                         const int *pairCircleIdx,
-                                        int totalMembership,
+                                        int totalPairs,
                                         int waveSize,
                                         int numTiles,
                                         const int *tileOffsets,
@@ -706,9 +713,9 @@ __global__ void kernelScatterWaveStable(const int *pairTileId,
 {
     int m = blockIdx.x;
     int waveStart = m * waveSize;
-    if (waveStart >= totalMembership)
+    if (waveStart >= totalPairs)
         return;
-    int waveEnd = min(waveStart + waveSize, totalMembership);
+    int waveEnd = min(waveStart + waveSize, totalPairs);
 
     extern __shared__ int heads[]; // size = numTiles
     for (int t = threadIdx.x; t < numTiles; t += blockDim.x)
@@ -754,6 +761,7 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
     bool inBounds = (offsetX < width) && (offsetY < height);
     int pixelOffset = 0;
     float r = 0.f, g = 0.f, b = 0.f, a = 0.f;
+    // no early-return
     if (inBounds)
     {
         pixelOffset = 4 * (offsetY * width + offsetX);
@@ -770,9 +778,12 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
                                          invHeight * (static_cast<float>(offsetY) + 0.5f));
 
     int tileId = tileY * tilesNumX + tileX;
+    // tileOffsets is a CSR (Compressed Sparse Row) array of length (numTiles + 1).
+    // For each tileId, tileOffsets[tileId] gives the starting index in the tileIndices array
+    // for the circles that overlap this tile. tileOffsets[tileId+1] is the end index (exclusive).
     int begin = tileOffsets[tileId];
     int end = tileOffsets[tileId + 1];
-    int segLen = end - begin;
+    int segLen = end - begin; // how many circles in this tile
 
     // Fast path for small segments: avoid shared-memory chunking overhead
     if (segLen <= DIRECT_SEG_LIMIT)
@@ -1123,7 +1134,7 @@ void CudaRenderer::advanceAnimation()
 
 void CudaRenderer::render()
 {
-    // Small-N fallback: direct per-pixel rendering avoids bin build overhead
+    // Small-N fallback: direct per-pixel rendering avoids overhead
     if (numberOfCircles <= 1024)
     {
         dim3 blockDim(32, 32, 1);
@@ -1151,14 +1162,14 @@ void CudaRenderer::render()
     dim3 gridCount((numberOfCircles + blockCount.x - 1) / blockCount.x, 1, 1);
     kernelCountTilesPerCircle<<<gridCount, blockCount>>>(tilesX, tilesY, tileW, tileH, dCircleCounts);
 
-    // 3) Host exclusive scan over per-circle counts -> circleBase, totalMembership
+    // 3) Host exclusive scan over per-circle counts -> circleBase, totalPairs
     std::vector<int> hCircleCounts(numberOfCircles);
     cudaMemcpy(hCircleCounts.data(), dCircleCounts, sizeof(int) * numberOfCircles, cudaMemcpyDeviceToHost);
     std::vector<int> hCircleBase(numberOfCircles + 1);
     hCircleBase[0] = 0;
     for (int i = 0; i < numberOfCircles; i++)
         hCircleBase[i + 1] = hCircleBase[i] + hCircleCounts[i];
-    int totalMembership = hCircleBase[numberOfCircles];
+    int totalPairs = hCircleBase[numberOfCircles];
 
     int *dCircleBase = NULL;
     cudaMalloc(&dCircleBase, sizeof(int) * numberOfCircles);
@@ -1167,8 +1178,8 @@ void CudaRenderer::render()
     // 4) Build pairs (tileId, circleIdx) by circle (device, ordered by circle)
     int *dPairTileId = NULL;
     int *dPairCircleIdx = NULL;
-    cudaMalloc(&dPairTileId, sizeof(int) * totalMembership);
-    cudaMalloc(&dPairCircleIdx, sizeof(int) * totalMembership);
+    cudaMalloc(&dPairTileId, sizeof(int) * totalPairs);
+    cudaMalloc(&dPairCircleIdx, sizeof(int) * totalPairs);
     kernelWriteCircleTilePairs<<<gridCount, blockCount>>>(
         cudaDevicePosition, cudaDeviceRadius, numberOfCircles,
         image->width, image->height,
@@ -1180,8 +1191,8 @@ void CudaRenderer::render()
     cudaMalloc(&dTileCounts, sizeof(int) * numTiles);
     cudaMemset(dTileCounts, 0, sizeof(int) * numTiles);
     dim3 blockPairs(256, 1, 1);
-    dim3 gridPairs((totalMembership + blockPairs.x - 1) / blockPairs.x, 1, 1);
-    kernelHistogramTilesFromPairs<<<gridPairs, blockPairs>>>(dPairTileId, totalMembership, numTiles, dTileCounts);
+    dim3 gridPairs((totalPairs + blockPairs.x - 1) / blockPairs.x, 1, 1);
+    kernelHistogramTilesFromPairs<<<gridPairs, blockPairs>>>(dPairTileId, totalPairs, numTiles, dTileCounts);
 
     std::vector<int> hCounts(numTiles);
     cudaMemcpy(hCounts.data(), dTileCounts, sizeof(int) * numTiles, cudaMemcpyDeviceToHost);
@@ -1196,33 +1207,38 @@ void CudaRenderer::render()
 
     // 6) Stable counting sort by tiles
     int *dTileIndices = NULL;
-    cudaMalloc(&dTileIndices, sizeof(int) * totalMembership);
+    cudaMalloc(&dTileIndices, sizeof(int) * totalPairs);
 
-    const int membershipHostCutoff = 50000; // hybrid: host scatter for small membership
-    if (totalMembership <= membershipHostCutoff)
+    // pairCutoff determines the threshold for choosing between host-side and device-side stable scatter.
+    // If the total number of (tile, circle) membership pairs is less than or equal to this cutoff,
+    // the code uses a host-side (CPU) stable scatter, which is faster for small numbers of pairs.
+    // For larger numbers, a device-side (GPU) scatter is used for better performance.
+    printf("totalPairs: %d\n", totalPairs);
+    const int pairCutoff = 10000;
+    if (totalPairs <= pairCutoff)
     {
         // Host-side stable scatter (fast at small sizes)
-        std::vector<int> hPairTileId(totalMembership);
-        std::vector<int> hPairCircleIdx(totalMembership);
-        cudaMemcpy(hPairTileId.data(), dPairTileId, sizeof(int) * totalMembership, cudaMemcpyDeviceToHost);
-        cudaMemcpy(hPairCircleIdx.data(), dPairCircleIdx, sizeof(int) * totalMembership, cudaMemcpyDeviceToHost);
+        std::vector<int> hPairTileId(totalPairs);
+        std::vector<int> hPairCircleIdx(totalPairs);
+        cudaMemcpy(hPairTileId.data(), dPairTileId, sizeof(int) * totalPairs, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hPairCircleIdx.data(), dPairCircleIdx, sizeof(int) * totalPairs, cudaMemcpyDeviceToHost);
 
-        std::vector<int> hTileIndices(totalMembership);
+        std::vector<int> hTileIndices(totalPairs);
         std::vector<int> heads(numTiles);
         for (int t = 0; t < numTiles; t++) heads[t] = hOffsets[t];
-        for (int k = 0; k < totalMembership; k++)
+        for (int k = 0; k < totalPairs; k++)
         {
             int t = hPairTileId[k];
             int pos = heads[t]++;
             hTileIndices[pos] = hPairCircleIdx[k];
         }
-        cudaMemcpy(dTileIndices, hTileIndices.data(), sizeof(int) * totalMembership, cudaMemcpyHostToDevice);
+        cudaMemcpy(dTileIndices, hTileIndices.data(), sizeof(int) * totalPairs, cudaMemcpyHostToDevice);
     }
     else
     {
         // Device-side stable counting sort across waves (better for large membership)
-        const int waveSize = 8192; // tuneable; large enough for coalesced passes
-        int numWaves = (totalMembership + waveSize - 1) / waveSize;
+        const int waveSize = 4096; // tuneable; large enough for coalesced passes
+        int numWaves = (totalPairs + waveSize - 1) / waveSize;
         int *dWaveCounts = NULL;
         int *dWaveBase = NULL;
         cudaMalloc(&dWaveCounts, sizeof(int) * numWaves * numTiles);
@@ -1230,14 +1246,14 @@ void CudaRenderer::render()
 
         // Count per wave
         int shmemCounts = sizeof(int) * numTiles;
-        kernelCountTilesPerWave<<<numWaves, 256, shmemCounts>>>(dPairTileId, totalMembership, numTiles, waveSize, dWaveCounts);
+        kernelCountTilesPerWave<<<numWaves, 256, shmemCounts>>>(dPairTileId, totalPairs, numTiles, waveSize, dWaveCounts);
 
         // Exclusive scan across waves per tile
         kernelExclusiveScanWaveCounts<<<numTiles, 1>>>(dWaveCounts, numWaves, numTiles, dWaveBase);
 
         // Scatter stably within each wave into final CSR locations
         int shmemHeads = sizeof(int) * numTiles;
-        kernelScatterWaveStable<<<numWaves, 256, shmemHeads>>>(dPairTileId, dPairCircleIdx, totalMembership,
+        kernelScatterWaveStable<<<numWaves, 256, shmemHeads>>>(dPairTileId, dPairCircleIdx, totalPairs,
                                                               waveSize, numTiles, dTileOffsets, dWaveBase, dTileIndices);
 
         cudaFree(dWaveCounts);
