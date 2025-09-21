@@ -61,8 +61,20 @@ __constant__ float cuConstColorRamp[COLOR_MAP_SIZE][3];
 #include "lookupColor.cu_inl"
 #include "circleBoxTest.cu_inl"
 
-#define SCAN_BLOCK_DIM 1024 // Must be power of 2
+#define SCAN_BLOCK_DIM 1024
 #include "exclusiveScan.cu_inl"
+
+static inline int nextPow2(int n)
+{
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n++;
+    return n;
+}
 
 // kernelClearImageSnowflake -- (CUDA device code)
 //
@@ -466,29 +478,34 @@ __global__ void kernelCountTilesPerCircle(int tilesX,
     float radius = pr.w;
 
     // Convert to normalized coordinates for tile calculations
+    // We use normalized coordinates (in [0,1]) so that all geometric calculations are independent of the actual image resolution.
+    // This allows us to easily compare circle and tile positions and sizes, regardless of pixel dimensions.
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
     float tileW_norm = tileW * invWidth;
     float tileH_norm = tileH * invHeight;
 
     int count = 0;
-    
+
     // Test each tile for intersection with the circle
-    for (int ty = 0; ty < tilesY; ty++) {
-        for (int tx = 0; tx < tilesX; tx++) {
+    for (int ty = 0; ty < tilesY; ty++)
+    {
+        for (int tx = 0; tx < tilesX; tx++)
+        {
             // Convert tile to normalized coordinates
             float tileL = tx * tileW_norm;
             float tileR = (tx + 1) * tileW_norm;
             float tileB = ty * tileH_norm;
             float tileT = (ty + 1) * tileH_norm;
-            
+
             // Test if circle intersects this tile using precise intersection test
-            if (circleInBox(cx, cy, radius, tileL, tileR, tileT, tileB)) {
+            if (circleInBox(cx, cy, radius, tileL, tileR, tileT, tileB))
+            {
                 count++;
             }
         }
     }
-    
+
     circleCounts[i] = count;
 }
 
@@ -522,18 +539,21 @@ __global__ void kernelWriteCircleTilePairs(const float *position,
 
     int base = circleBase[i];
     int pairOffset = 0;
-    
+
     // Test each tile for intersection with the circle
-    for (int ty = 0; ty < tilesY; ty++) {
-        for (int tx = 0; tx < tilesX; tx++) {
+    for (int ty = 0; ty < tilesY; ty++)
+    {
+        for (int tx = 0; tx < tilesX; tx++)
+        {
             // Convert tile to normalized coordinates
             float tileL = tx * tileW_norm;
             float tileR = (tx + 1) * tileW_norm;
             float tileB = ty * tileH_norm;
             float tileT = (ty + 1) * tileH_norm;
-            
+
             // Test if circle intersects this tile using precise intersection test
-            if (circleInBox(cx, cy, r, tileL, tileR, tileT, tileB)) {
+            if (circleInBox(cx, cy, r, tileL, tileR, tileT, tileB))
+            {
                 int tileId = ty * tilesX + tx;
                 int pairIdx = base + pairOffset;
                 pairTileId[pairIdx] = tileId;
@@ -606,6 +626,51 @@ __global__ void kernelExclusiveScanWaveCounts(const int *waveCounts,
         int c = waveCounts[idx];
         waveBase[idx] = acc;
         acc += c;
+    }
+}
+
+// 2) Exclusive scan across waves per tile using shared memory scan for better performance
+__global__ void kernelExclusiveScanWaveCountsSharedMem(const int *waveCounts,
+                                              int numWaves,
+                                              int numTiles,
+                                              int *waveBase,
+                                              int alignedWaves)
+{
+    int tile = blockIdx.x;
+    if (tile >= numTiles)
+        return;
+
+    // Use shared memory for parallel exclusive scan
+    extern __shared__ uint sData[];
+    uint *sInput = sData;
+    uint *sOutput = sData + alignedWaves;
+    uint *sScratch = sData + 2 * alignedWaves;
+
+    int tid = threadIdx.x;
+
+    // Initialize shared memory arrays
+    if (tid < alignedWaves) {
+        sInput[tid] = 0;
+        sOutput[tid] = 0;
+    }
+    __syncthreads();
+
+    // Load wave counts for this tile into shared memory
+    // Only load up to numWaves, pad the rest with zeros
+    if (tid < numWaves) {
+        int idx = tid * numTiles + tile;
+        sInput[tid] = (uint)waveCounts[idx];
+    }
+    __syncthreads();
+
+    // Perform exclusive scan using shared memory
+    sharedMemExclusiveScan(tid, sInput, sOutput, sScratch, alignedWaves);
+    __syncthreads();
+
+    // Write results back to global memory
+    if (tid < numWaves) {
+        int idx = tid * numTiles + tile;
+        waveBase[idx] = (int)sOutput[tid];
     }
 }
 
@@ -1133,10 +1198,11 @@ void CudaRenderer::render()
     int *dTileIndices = NULL;
     cudaMalloc(&dTileIndices, sizeof(int) * totalPairs);
 
-    const int pairCutoff = 10000;
+    const int pairCutoff = 2000;
+    printf("totalPairs: %d\n", totalPairs);
     if (totalPairs <= pairCutoff)
     {
-        // Host-side stable scatter (fast at small sizes)
+        // Host-side stable scatter (only for very small sizes)
         std::vector<int> hPairTileId(totalPairs);
         std::vector<int> hPairCircleIdx(totalPairs);
         cudaMemcpy(hPairTileId.data(), dPairTileId, sizeof(int) * totalPairs, cudaMemcpyDeviceToHost);
@@ -1156,9 +1222,20 @@ void CudaRenderer::render()
     }
     else
     {
-        // Device-side stable counting sort across waves (for very large tile counts)
-        const int waveSize = 4096;
+        // Optimized wave sizing for medium-sized workloads (2000-10000 pairs)
+        int targetWaves;
+        if (totalPairs <= 10000) {
+            targetWaves = 64;
+        } else if (totalPairs <= 200000) {
+            targetWaves = 256;
+        } else {
+            targetWaves = 512; // Large waves for big workloads
+        }
+        
+        int waveSize = max(64, (totalPairs + targetWaves - 1) / targetWaves); 
         int numWaves = (totalPairs + waveSize - 1) / waveSize;
+        
+        printf("Adaptive wave sizing, waveSize=%d, numWaves=%d\n", waveSize, numWaves);
         int *dWaveCounts = NULL;
         int *dWaveBase = NULL;
         cudaMalloc(&dWaveCounts, sizeof(int) * numWaves * numTiles);
@@ -1169,7 +1246,21 @@ void CudaRenderer::render()
         kernelCountTilesPerWave<<<numWaves, 256, shmemCounts>>>(dPairTileId, totalPairs, numTiles, waveSize, dWaveCounts);
 
         // Exclusive scan across waves per tile
-        kernelExclusiveScanWaveCounts<<<numTiles, 1>>>(dWaveCounts, numWaves, numTiles, dWaveBase);
+        printf("totalPairs: %d, numTiles: %d, numWaves: %d\n", totalPairs, numTiles, numWaves);
+        
+        // Adaptive strategy: choose optimal scan method based on workload
+        int alignedWaves = nextPow2(numWaves);
+        alignedWaves = min(alignedWaves, SCAN_BLOCK_DIM);
+        
+        float efficiency = 100.0 * numWaves / alignedWaves;
+        printf("Scan analysis: numWaves=%d, alignedWaves=%d, efficiency=%.1f%%\n", numWaves, alignedWaves, efficiency);
+        
+        if (numWaves >= 64 && efficiency >= 50.0) {
+            int shmemScanSize = sizeof(uint) * (alignedWaves + alignedWaves + 2 * SCAN_BLOCK_DIM);
+            kernelExclusiveScanWaveCountsSharedMem<<<numTiles, alignedWaves, shmemScanSize>>>(dWaveCounts, numWaves, numTiles, dWaveBase, alignedWaves);
+        } else {
+            kernelExclusiveScanWaveCounts<<<numTiles, 1>>>(dWaveCounts, numWaves, numTiles, dWaveBase);
+        }
 
         // Scatter stably within each wave into final CSR locations
         int shmemHeads = sizeof(int) * numTiles;
