@@ -26,6 +26,7 @@ private:
     float* cudaDeviceColor;
     float* cudaDeviceRadius;
     float* cudaDeviceImageData;
+    float* cudaDevicePosRad4; // packed float4 buffer (pos.xyz, radius)
 
 public:
 
