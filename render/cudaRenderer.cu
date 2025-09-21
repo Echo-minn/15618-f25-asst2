@@ -59,6 +59,7 @@ __constant__ float cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+#include "circleBoxTest.cu_inl"
 
 #define SCAN_BLOCK_DIM 1024 // Must be power of 2
 #include "exclusiveScan.cu_inl"
@@ -442,7 +443,7 @@ __global__ void kernelRenderPixels()
 // GPU binning: count -> host scan -> fill -> per-tile serial sort
 ////////////////////////////////////////////////////////////////////////////////////////
 
-// Count tiles overlapped per circle (rectangle of tiles bounding the circle)
+// Count tiles overlapped per circle (precise circle-box intersection)
 __global__ void kernelCountTilesPerCircle(int tilesX,
                                           int tilesY,
                                           int tileW,
@@ -462,23 +463,33 @@ __global__ void kernelCountTilesPerCircle(int tilesX,
 
     float cx = pr.x;
     float cy = pr.y;
+    float radius = pr.w;
 
-    int minPx = max(0, (int)floorf((cx - pr.w) * imageWidth));
-    int maxPx = min(imageWidth - 1, (int)floorf((cx + pr.w) * imageWidth));
-    int minPy = max(0, (int)floorf((cy - pr.w) * imageHeight));
-    int maxPy = min(imageHeight - 1, (int)floorf((cy + pr.w) * imageHeight));
+    // Convert to normalized coordinates for tile calculations
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float tileW_norm = tileW * invWidth;
+    float tileH_norm = tileH * invHeight;
 
-    int minTx = minPx / tileW;
-    int maxTx = maxPx / tileW;
-    int minTy = minPy / tileH;
-    int maxTy = maxPy / tileH;
-    minTx = max(0, min(minTx, tilesX - 1));
-    maxTx = max(0, min(maxTx, tilesX - 1));
-    minTy = max(0, min(minTy, tilesY - 1));
-    maxTy = max(0, min(maxTy, tilesY - 1));
-
-    int count = (maxTx - minTx + 1) * (maxTy - minTy + 1);
-    circleCounts[i] = max(0, count);
+    int count = 0;
+    
+    // Test each tile for intersection with the circle
+    for (int ty = 0; ty < tilesY; ty++) {
+        for (int tx = 0; tx < tilesX; tx++) {
+            // Convert tile to normalized coordinates
+            float tileL = tx * tileW_norm;
+            float tileR = (tx + 1) * tileW_norm;
+            float tileB = ty * tileH_norm;
+            float tileT = (ty + 1) * tileH_norm;
+            
+            // Test if circle intersects this tile using precise intersection test
+            if (circleInBox(cx, cy, radius, tileL, tileR, tileT, tileB)) {
+                count++;
+            }
+        }
+    }
+    
+    circleCounts[i] = count;
 }
 
 // Write pairs (tileId, circleIdx) for each circle into a contiguous segment
@@ -503,36 +514,32 @@ __global__ void kernelWriteCircleTilePairs(const float *position,
     float cy = position[3 * i + 1];
     float r = radius[i];
 
-    // pixel coordinate range covered by the circle.
-    // recover normalized [0,1] coordinates.
-    // TODO: why normalized coordinates
-    int minPx = max(0, (int)floorf((cx - r) * imageWidth));
-    int maxPx = min(imageWidth - 1, (int)floorf((cx + r) * imageWidth));
-    int minPy = max(0, (int)floorf((cy - r) * imageHeight));
-    int maxPy = min(imageHeight - 1, (int)floorf((cy + r) * imageHeight));
-
-    int minTx = minPx / tileW;
-    int maxTx = maxPx / tileW;
-    int minTy = minPy / tileH;
-    int maxTy = maxPy / tileH;
-    minTx = max(0, min(minTx, tilesX - 1));
-    maxTx = max(0, min(maxTx, tilesX - 1));
-    minTy = max(0, min(minTy, tilesY - 1));
-    maxTy = max(0, min(maxTy, tilesY - 1));
+    // Convert to normalized coordinates for tile calculations
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float tileW_norm = tileW * invWidth;
+    float tileH_norm = tileH * invHeight;
 
     int base = circleBase[i];
     int pairOffset = 0;
-    for (int ty = minTy; ty <= maxTy; ty++)
-    {
-        for (int tx = minTx; tx <= maxTx; tx++)
-        {
-            int tileId = ty * tilesX + tx;
-            // k is the global index in the output arrays for the (tile, circle) pair.
-            // It is computed as the base offset for this circle plus the current offset w.
-            int pairIdx = base + pairOffset;
-            pairTileId[pairIdx] = tileId;
-            pairCircleIdx[pairIdx] = i;
-            pairOffset++;
+    
+    // Test each tile for intersection with the circle
+    for (int ty = 0; ty < tilesY; ty++) {
+        for (int tx = 0; tx < tilesX; tx++) {
+            // Convert tile to normalized coordinates
+            float tileL = tx * tileW_norm;
+            float tileR = (tx + 1) * tileW_norm;
+            float tileB = ty * tileH_norm;
+            float tileT = (ty + 1) * tileH_norm;
+            
+            // Test if circle intersects this tile using precise intersection test
+            if (circleInBox(cx, cy, r, tileL, tileR, tileT, tileB)) {
+                int tileId = ty * tilesX + tx;
+                int pairIdx = base + pairOffset;
+                pairTileId[pairIdx] = tileId;
+                pairCircleIdx[pairIdx] = i;
+                pairOffset++;
+            }
         }
     }
 }
@@ -632,54 +639,6 @@ __global__ void kernelScatterWaveStable(const int *pairTileId,
             tileIndices[pos] = pairCircleIdx[k];
             heads[tile]++;
         }
-    }
-}
-
-__global__ void kernelSimpleCountingSort(const int *pairTileId,
-                                         const int *pairCircleIdx,
-                                         int totalPairs,
-                                         int numTiles,
-                                         const int *tileOffsets,
-                                         int *tileIndices)
-{
-
-    extern __shared__ int sData[];
-    int *sCounts = sData;
-    int *sScratch = sData + numTiles;
-    int *sOutput = sData + 3 * numTiles;
-
-    int tid = threadIdx.x;
-
-    // Initialize
-    for (int t = tid; t < numTiles; t += blockDim.x)
-    {
-        sCounts[t] = 0;
-    }
-    __syncthreads();
-
-    // Histogram
-    for (int k = tid; k < totalPairs; k += blockDim.x)
-    {
-        int tile = pairTileId[k];
-        atomicAdd(&sCounts[tile], 1);
-    }
-    __syncthreads();
-
-    // Copy to output for scan
-    if (tid < numTiles)
-        sOutput[tid] = sCounts[tid];
-    __syncthreads();
-
-    // Exclusive scan
-    sharedMemExclusiveScan(tid, sOutput, sOutput, sScratch, numTiles);
-    __syncthreads();
-
-    // Scatter
-    for (int k = tid; k < totalPairs; k += blockDim.x)
-    {
-        int tile = pairTileId[k];
-        int pos = tileOffsets[tile] + atomicAdd(&sOutput[tile], 1);
-        tileIndices[pos] = pairCircleIdx[k];
     }
 }
 
@@ -1175,7 +1134,6 @@ void CudaRenderer::render()
     cudaMalloc(&dTileIndices, sizeof(int) * totalPairs);
 
     const int pairCutoff = 10000;
-    const int maxScanTiles = 1024;  // Power of 2 for shared memory scan
     if (totalPairs <= pairCutoff)
     {
         // Host-side stable scatter (fast at small sizes)
@@ -1195,16 +1153,6 @@ void CudaRenderer::render()
             hTileIndices[pos] = hPairCircleIdx[k];
         }
         cudaMemcpy(dTileIndices, hTileIndices.data(), sizeof(int) * totalPairs, cudaMemcpyHostToDevice);
-    }
-    else if (numTiles <= maxScanTiles)
-    {
-        // Use shared memory exclusive scan (simpler and faster for medium sizes)
-        int paddedTiles = 1;
-        while (paddedTiles < numTiles) paddedTiles <<= 1;  // Pad to power of 2
-        
-        int shmemSize = sizeof(int) * (4 * paddedTiles);  // counts + scratch + output + padding
-        kernelSimpleCountingSort<<<1, SCAN_BLOCK_DIM, shmemSize>>>(
-            dPairTileId, dPairCircleIdx, totalPairs, paddedTiles, dTileOffsets, dTileIndices);
     }
     else
     {
