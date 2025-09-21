@@ -1198,7 +1198,7 @@ void CudaRenderer::render()
     int *dTileIndices = NULL;
     cudaMalloc(&dTileIndices, sizeof(int) * totalPairs);
 
-    const int pairCutoff = 2000;
+    const int pairCutoff = 5000;
     printf("totalPairs: %d\n", totalPairs);
     if (totalPairs <= pairCutoff)
     {
@@ -1244,9 +1244,6 @@ void CudaRenderer::render()
         // Count per wave
         int shmemCounts = sizeof(int) * numTiles;
         kernelCountTilesPerWave<<<numWaves, 256, shmemCounts>>>(dPairTileId, totalPairs, numTiles, waveSize, dWaveCounts);
-
-        // Exclusive scan across waves per tile
-        printf("totalPairs: %d, numTiles: %d, numWaves: %d\n", totalPairs, numTiles, numWaves);
         
         // Adaptive strategy: choose optimal scan method based on workload
         int alignedWaves = nextPow2(numWaves);
