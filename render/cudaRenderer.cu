@@ -359,7 +359,7 @@ __device__ inline void atomicBlendAssign(float *addr, float alpha, float src)
     }
 }
 
-// Pack position.xyz and radius into float4 array on device
+// Pack position.xyz and radius into float4
 __global__ void kernelPackPosRad4(const float *position,
                                   const float *radius,
                                   int numCircles,
@@ -373,6 +373,7 @@ __global__ void kernelPackPosRad4(const float *position,
     ((float4 *)posRad4)[i] = pr;
 }
 
+// Use bool template to determine whether to use snowflake or not
 template<bool isSnowflake>
 __device__ __inline__ void shadePixel(float pixelDist, float rad, float4 pr, int i, float3& rgb, float& alpha)
 {
@@ -460,7 +461,7 @@ __global__ void kernelRenderPixels()
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
-// GPU binning: count -> host scan -> fill -> per-tile serial sort
+// GPU binning(count -> host scan -> fill -> per-tile serial sort)
 ////////////////////////////////////////////////////////////////////////////////////////
 
 // Count tiles overlapped per circle (precise circle-box intersection)
@@ -536,9 +537,9 @@ __global__ void kernelWriteCircleTilePairs(
                                            int tilesY,
                                            int tileW,
                                            int tileH,
-                                           const int *circleBase, // An array where circleBase[i] gives the starting index in the output arrays for the i-th circle's tile pairs.
-                                           int *pairTileId,       // Output array to store the tile ID for each (tile, circle) pair that the circle overlaps.
-                                           int *pairCircleId)    // Output array to store the circle index for each (tile, circle) pair; aligns with pairTileId.
+                                           const int *circleBase,
+                                           int *pairTileId,
+                                           int *pairCircleId)
 {
     int circleIdx = blockIdx.x * blockDim.x + threadIdx.x;
     int numCircles = cuConstRendererParams.numberOfCircles;
@@ -555,7 +556,7 @@ __global__ void kernelWriteCircleTilePairs(
     float cy = pr.y;
     float r = pr.w;
 
-    // Convert to normalized coordinates for tile calculations
+    // Convert to normalized coordinates
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
     float tileW_norm = tileW * invWidth;
@@ -582,6 +583,7 @@ __global__ void kernelWriteCircleTilePairs(
     if (txMin <= txMax && tyMin <= tyMax)
     {
         // Test candidate tiles and write pairs for precise intersections
+        // !! O(tilesX * tilesY) -> O(intersected tiles)
         for (int ty = tyMin; ty <= tyMax; ty++)
         {
             for (int tx = txMin; tx <= txMax; tx++)
@@ -606,14 +608,13 @@ __global__ void kernelWriteCircleTilePairs(
 
 // Histogram tiles from pairs (one thread per pair entry)
 __global__ void kernelHistogramTilesFromPairs(const int *pairTileId,
-                                              int totalPairs, // The total number of (tile, circle) pairs
+                                              int totalPairs,
                                               int numTiles,
                                               int *tileCounts)
 {
     // Use shared memory to reduce atomic operations
     extern __shared__ int sCounts[];
     
-    // Initialize shared memory
     for (int t = threadIdx.x; t < numTiles; t += blockDim.x)
         sCounts[t] = 0;
     __syncthreads();
@@ -637,8 +638,8 @@ __global__ void kernelHistogramTilesFromPairs(const int *pairTileId,
 }
 
 // Count tiles per batch into batchCounts[m][tile]
-//    - Here, a "batch" refers to a chunk of up to batchSize consecutive (tile, circle) pairs.
-//    - Each block processes one batch (i.e., a range of indices [m*batchSize, (m+1)*batchSize)), allowing the sort to be performed in manageable batches.
+//    - batch is a chunk of up to batchSize consecutive (tile, circle) pairs.
+//    - Each block processes one batch
 __global__ void kernelCountTilesPerBatch(const int *pairTileId,
                                         int totalPairs,
                                         int numTiles,
@@ -667,26 +668,7 @@ __global__ void kernelCountTilesPerBatch(const int *pairTileId,
         batchCounts[m * numTiles + t] = sCounts[t];
 }
 
-// 2) Exclusive scan across batchs per tile: batchBase[m][tile] = sum_{w<m} batchCounts[w][tile]
-__global__ void kernelExclusiveScanBatchCounts(const int *batchCounts,
-                                              int numBatchs,
-                                              int numTiles,
-                                              int *batchBase)
-{
-    int tile = blockIdx.x;
-    if (tile >= numTiles)
-        return;
-    int acc = 0;
-    for (int m = 0; m < numBatchs; m++)
-    {
-        int idx = m * numTiles + tile;
-        int c = batchCounts[idx];
-        batchBase[idx] = acc;
-        acc += c;
-    }
-}
-
-// 2) Exclusive scan across batchs per tile using shared memory scan for better performance
+// Exclusive scan across batchs per tile(shared memory)
 __global__ void kernelExclusiveScanBatchCountsSharedMem(const int *batchCounts,
                                               int numBatchs,
                                               int numTiles,
@@ -731,7 +713,7 @@ __global__ void kernelExclusiveScanBatchCountsSharedMem(const int *batchCounts,
     }
 }
 
-// 3) Stable scatter within each batch using batch-local heads, preserving pair order
+// Stable scatter within each batch using batch-local heads, preserving pair order
 __global__ void kernelScatterBatchStable(const int *pairTileId,
                                         const int *pairCircleId,
                                         int totalPairs,
@@ -757,6 +739,7 @@ __global__ void kernelScatterBatchStable(const int *pairTileId,
         for (int k = batchStart; k < batchEnd; k++)
         {
             int tile = pairTileId[k];
+            // pos is the position in the tileIndices array
             int pos = tileOffsets[tile] + batchBase[m * numTiles + tile] + heads[tile];
             tileIndices[pos] = pairCircleId[k];
             heads[tile]++;
@@ -766,7 +749,7 @@ __global__ void kernelScatterBatchStable(const int *pairTileId,
 
 // Render using pre-built CSR bins; preserves order via per-tile sorted indices
 #ifndef BIN_CHUNK
-#define BIN_CHUNK 128
+#define BIN_CHUNK 256
 #endif
 #ifndef DIRECT_SEG_LIMIT
 #define DIRECT_SEG_LIMIT 64
@@ -809,9 +792,6 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
                                          invHeight * (static_cast<float>(offsetY) + 0.5f));
 
     int tileId = tileY * tilesNumX + tileX;
-    // tileOffsets is a CSR (Compressed Sparse Row) array of length (numTiles + 1).
-    // For each tileId, tileOffsets[tileId] gives the starting index in the tileIndices array
-    // for the circles that overlap this tile. tileOffsets[tileId+1] is the end index (exclusive).
     int begin = tileOffsets[tileId];
     int end = tileOffsets[tileId + 1];
     int segLen = end - begin; // how many circles in this tile
@@ -866,7 +846,7 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
         }
         __syncthreads();
 
-        // Shade against the shared chunk
+        // Shade with the shared chunk
         for (int j = 0; j < chunkLen; j++)
         {
             float4 pr = sPR[j];
@@ -1193,7 +1173,7 @@ void CudaRenderer::render()
     cudaMemcpy(hCircleCounts.data(), dCircleCounts, sizeof(int) * numberOfCircles, cudaMemcpyDeviceToHost);
     std::vector<int> hCircleBase(numberOfCircles + 1);
     hCircleBase[0] = 0;
-    for (int i = 0; i < numberOfCircles; i++)
+    for (int i = 0; i < numberOfCircles; i++) // O(numberOfCircles)
         hCircleBase[i + 1] = hCircleBase[i] + hCircleCounts[i];
     int totalPairs = hCircleBase[numberOfCircles];
 
@@ -1202,7 +1182,6 @@ void CudaRenderer::render()
     cudaMemcpy(dCircleBase, hCircleBase.data(), sizeof(int) * numberOfCircles, cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
     double endCircleBaseTime = CycleTimer::currentSeconds();
-    printf("Circle base time: %.3f ms\n", 1000.0 * (endCircleBaseTime - startCircleBaseTime));
 
     // 4) Build pairs (tileId, circleIdx) by circle (device, ordered by circle)
     double startWritePairsTime = CycleTimer::currentSeconds();
@@ -1215,9 +1194,8 @@ void CudaRenderer::render()
         dCircleBase, dPairTileId, dPairCircleId);
     cudaDeviceSynchronize();
     double endWritePairsTime = CycleTimer::currentSeconds();
-    printf("Build pairs time: %.3f ms\n", 1000.0 * (endWritePairsTime - startWritePairsTime));
 
-    // 5) Histogram tiles from pairs -> counts (device); host scan -> CSR offsets
+    // 5) Histogram tiles from pairs -> counts (device)
     int *dTileCounts = NULL;
     cudaMalloc(&dTileCounts, sizeof(int) * numTiles);
     cudaMemset(dTileCounts, 0, sizeof(int) * numTiles);
@@ -1229,8 +1207,8 @@ void CudaRenderer::render()
     kernelHistogramTilesFromPairs<<<gridPairs, blockPairs, shmemHistSize>>>(dPairTileId, totalPairs, numTiles, dTileCounts);
     cudaDeviceSynchronize();
     double endHistogramTime = CycleTimer::currentSeconds();
-    printf("Histogram tiles from pairs time: %.3f ms\n", 1000.0 * (endHistogramTime - startHistogramTime));
     
+    // 6) Host scan -> offsets
     double startHostOffsetsTime = CycleTimer::currentSeconds();
     std::vector<int> hCounts(numTiles);
     cudaMemcpy(hCounts.data(), dTileCounts, sizeof(int) * numTiles, cudaMemcpyDeviceToHost);
@@ -1238,24 +1216,25 @@ void CudaRenderer::render()
     hOffsets[0] = 0;
     for (int t = 0; t < numTiles; t++)
         hOffsets[t + 1] = hOffsets[t] + hCounts[t];
-
-    // tileOffsets is a CSR (Compressed Sparse Row) array of length (numTiles + 1).
-    // For each tileId, tileOffsets[tileId] gives the starting index in the tileIndices array
-    // for the circles that overlap this tile. tileOffsets[tileId+1] is the end index (exclusive).
-    int *dTileOffsets = NULL;
+    int *dTileOffsets = NULL; // For each tileId, tileOffsets[tileId] gives the starting index in the tileIndices array
     cudaMalloc(&dTileOffsets, sizeof(int) * (numTiles + 1));
     cudaMemcpy(dTileOffsets, hOffsets.data(), sizeof(int) * (numTiles + 1), cudaMemcpyHostToDevice);
     cudaDeviceSynchronize();
     double endHostOffsetsTime = CycleTimer::currentSeconds();
-    printf("Host offsets time: %.3f ms\n", 1000.0 * (endHostOffsetsTime - startHostOffsetsTime));
 
-    // 6) Stable counting sort by tiles
+    // 7) Stable sort by tiles(preserve order, tileId first, circleId second)
     double startSortTime = CycleTimer::currentSeconds();
     int *dTileIndices = NULL; // tileIndices is an array of length totalPairs, where each element is circleId in the tileIndices array.
     cudaMalloc(&dTileIndices, sizeof(int) * totalPairs);
 
-    const int pairCutoff = 5000;
     printf("totalPairs: %d, tilesX: %d, tilesY: %d\n", totalPairs, tilesX, tilesY);
+    double startCountTime = 0;
+    double endCountTime = 0;
+    double startScanTime = 0;
+    double endScanTime = 0;
+    double startScatterTime = 0;
+    double endScatterTime = 0;
+    const int pairCutoff = 5000;
     if (totalPairs <= pairCutoff)
     {
         // Host-side stable scatter (only for very small sizes)
@@ -1300,43 +1279,35 @@ void CudaRenderer::render()
 
         // Count per batch
         int shmemCounts = sizeof(int) * numTiles;
+        startCountTime = CycleTimer::currentSeconds();
         kernelCountTilesPerBatch<<<numBatchs, 256, shmemCounts>>>(dPairTileId, totalPairs, numTiles, batchSize, dBatchCounts);
+        cudaDeviceSynchronize();
+        endCountTime = CycleTimer::currentSeconds();
         
-        // Adaptive strategy: choose optimal scan method based on workload
         int alignedBatchs = nextPow2(numBatchs);
         alignedBatchs = min(alignedBatchs, SCAN_BLOCK_DIM);
-        
-        float efficiency = 100.0 * numBatchs / alignedBatchs;
-        printf("Scan analysis: numBatchs=%d, alignedBatchs=%d, efficiency=%.1f%%\n", numBatchs, alignedBatchs, efficiency);
-
-        double startScanTime = CycleTimer::currentSeconds();
-        if (numBatchs >= 64 && efficiency >= 50.0) {
-            int shmemScanSize = sizeof(uint) * (alignedBatchs + alignedBatchs + 2 * SCAN_BLOCK_DIM);
-            kernelExclusiveScanBatchCountsSharedMem<<<numTiles, alignedBatchs, shmemScanSize>>>(dBatchCounts, numBatchs, numTiles, dBatchBase, alignedBatchs);
-        } else {
-            kernelExclusiveScanBatchCounts<<<numTiles, 1>>>(dBatchCounts, numBatchs, numTiles, dBatchBase);
-        }
+        printf("Scan analysis: numBatchs=%d, alignedBatchs=%d\n", numBatchs, alignedBatchs);
+        startScanTime = CycleTimer::currentSeconds();
+        int shmemScanSize = sizeof(uint) * (alignedBatchs + alignedBatchs + 2 * SCAN_BLOCK_DIM);
+        kernelExclusiveScanBatchCountsSharedMem<<<numTiles, alignedBatchs, shmemScanSize>>>(dBatchCounts, numBatchs, numTiles, dBatchBase, alignedBatchs);
         cudaDeviceSynchronize();
-        double endScanTime = CycleTimer::currentSeconds();
-        printf("Exclusive scan time: %.3f ms\n", 1000.0 * (endScanTime - startScanTime));
+        endScanTime = CycleTimer::currentSeconds();
 
         // Scatter stably within each batch
-        double startScatterTime = CycleTimer::currentSeconds();
+        startScatterTime = CycleTimer::currentSeconds();
         int shmemHeads = sizeof(int) * numTiles;
         kernelScatterBatchStable<<<numBatchs, 256, shmemHeads>>>(dPairTileId, dPairCircleId, totalPairs,
                                                                batchSize, numTiles, dTileOffsets, dBatchBase, dTileIndices);
         cudaDeviceSynchronize();
-        double endScatterTime = CycleTimer::currentSeconds();
-        printf("Scatter time: %.3f ms\n", 1000.0 * (endScatterTime - startScatterTime));
+        endScatterTime = CycleTimer::currentSeconds();
 
         cudaFree(dBatchCounts);
         cudaFree(dBatchBase);
     }
     cudaDeviceSynchronize();
     double endSortTime = CycleTimer::currentSeconds();
-    printf("Stable sort time: %.3f ms\n", 1000.0 * (endSortTime - startSortTime));
 
-    // 7) Render per pixel binning (one block per tile, one thread per pixel)
+    // 8) Render per pixel binning (one block per tile, one thread per pixel)
     double startRenderTime = CycleTimer::currentSeconds();
     dim3 blockRender(tileW, tileH, 1);
     dim3 gridRender(tilesX, tilesY);
@@ -1351,7 +1322,6 @@ void CudaRenderer::render()
     }
     cudaDeviceSynchronize();
     double endRenderTime = CycleTimer::currentSeconds();
-    printf("Render time: %.3f ms\n", 1000.0 * (endRenderTime - startRenderTime));
 
     // 8) Cleanup
     cudaFree(dCircleCounts);
@@ -1361,4 +1331,15 @@ void CudaRenderer::render()
     cudaFree(dTileCounts);
     cudaFree(dTileOffsets);
     cudaFree(dTileIndices);
+
+    // 9) Print statistics
+    printf("Circle base time: %.3f ms\n", 1000.0 * (endCircleBaseTime - startCircleBaseTime));
+    printf("Write pairs time: %.3f ms\n", 1000.0 * (endWritePairsTime - startWritePairsTime));
+    printf("Histogram time: %.3f ms\n", 1000.0 * (endHistogramTime - startHistogramTime));
+    printf("Host offsets time: %.3f ms\n", 1000.0 * (endHostOffsetsTime - startHostOffsetsTime));
+    printf("Count time: %.3f ms\n", 1000.0 * (endCountTime - startCountTime));
+    printf("Scan time: %.3f ms\n", 1000.0 * (endScanTime - startScanTime));
+    printf("Scatter time: %.3f ms\n", 1000.0 * (endScatterTime - startScatterTime));
+    printf("Stable sort time: %.3f ms\n", 1000.0 * (endSortTime - startSortTime));
+    printf("Render time: %.3f ms\n", 1000.0 * (endRenderTime - startRenderTime));
 }
