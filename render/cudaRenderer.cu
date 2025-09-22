@@ -636,27 +636,27 @@ __global__ void kernelHistogramTilesFromPairs(const int *pairTileId,
         atomicAdd(&tileCounts[t], sCounts[t]);
 }
 
-// Count tiles per wave into waveCounts[m][tile]
-//    - Here, a "wave" refers to a chunk of up to waveSize consecutive (tile, circle) pairs.
-//    - Each block processes one wave (i.e., a range of indices [m*waveSize, (m+1)*waveSize)), allowing the sort to be performed in manageable batches.
-__global__ void kernelCountTilesPerWave(const int *pairTileId,
+// Count tiles per batch into batchCounts[m][tile]
+//    - Here, a "batch" refers to a chunk of up to batchSize consecutive (tile, circle) pairs.
+//    - Each block processes one batch (i.e., a range of indices [m*batchSize, (m+1)*batchSize)), allowing the sort to be performed in manageable batches.
+__global__ void kernelCountTilesPerBatch(const int *pairTileId,
                                         int totalPairs,
                                         int numTiles,
-                                        int waveSize,
-                                        int *waveCounts)
+                                        int batchSize,
+                                        int *batchCounts)
 {
     int m = blockIdx.x;
-    int waveStart = m * waveSize;
-    if (waveStart >= totalPairs)
+    int batchStart = m * batchSize;
+    if (batchStart >= totalPairs)
         return;
-    int waveEnd = min(waveStart + waveSize, totalPairs);
+    int batchEnd = min(batchStart + batchSize, totalPairs);
 
     extern __shared__ int sCounts[]; // size = numTiles
     for (int t = threadIdx.x; t < numTiles; t += blockDim.x)
         sCounts[t] = 0;
     __syncthreads();
 
-    for (int k = waveStart + threadIdx.x; k < waveEnd; k += blockDim.x)
+    for (int k = batchStart + threadIdx.x; k < batchEnd; k += blockDim.x)
     {
         int tile = pairTileId[k];
         atomicAdd(&sCounts[tile], 1);
@@ -664,34 +664,34 @@ __global__ void kernelCountTilesPerWave(const int *pairTileId,
     __syncthreads();
 
     for (int t = threadIdx.x; t < numTiles; t += blockDim.x)
-        waveCounts[m * numTiles + t] = sCounts[t];
+        batchCounts[m * numTiles + t] = sCounts[t];
 }
 
-// 2) Exclusive scan across waves per tile: waveBase[m][tile] = sum_{w<m} waveCounts[w][tile]
-__global__ void kernelExclusiveScanWaveCounts(const int *waveCounts,
-                                              int numWaves,
+// 2) Exclusive scan across batchs per tile: batchBase[m][tile] = sum_{w<m} batchCounts[w][tile]
+__global__ void kernelExclusiveScanBatchCounts(const int *batchCounts,
+                                              int numBatchs,
                                               int numTiles,
-                                              int *waveBase)
+                                              int *batchBase)
 {
     int tile = blockIdx.x;
     if (tile >= numTiles)
         return;
     int acc = 0;
-    for (int m = 0; m < numWaves; m++)
+    for (int m = 0; m < numBatchs; m++)
     {
         int idx = m * numTiles + tile;
-        int c = waveCounts[idx];
-        waveBase[idx] = acc;
+        int c = batchCounts[idx];
+        batchBase[idx] = acc;
         acc += c;
     }
 }
 
-// 2) Exclusive scan across waves per tile using shared memory scan for better performance
-__global__ void kernelExclusiveScanWaveCountsSharedMem(const int *waveCounts,
-                                              int numWaves,
+// 2) Exclusive scan across batchs per tile using shared memory scan for better performance
+__global__ void kernelExclusiveScanBatchCountsSharedMem(const int *batchCounts,
+                                              int numBatchs,
                                               int numTiles,
-                                              int *waveBase,
-                                              int alignedWaves)
+                                              int *batchBase,
+                                              int alignedBatchs)
 {
     int tile = blockIdx.x;
     if (tile >= numTiles)
@@ -700,52 +700,52 @@ __global__ void kernelExclusiveScanWaveCountsSharedMem(const int *waveCounts,
     // Use shared memory for parallel exclusive scan
     extern __shared__ uint sData[];
     uint *sInput = sData;
-    uint *sOutput = sData + alignedWaves;
-    uint *sScratch = sData + 2 * alignedWaves;
+    uint *sOutput = sData + alignedBatchs;
+    uint *sScratch = sData + 2 * alignedBatchs;
 
     int tid = threadIdx.x;
 
     // Initialize shared memory arrays
-    if (tid < alignedWaves) {
+    if (tid < alignedBatchs) {
         sInput[tid] = 0;
         sOutput[tid] = 0;
     }
     __syncthreads();
 
-    // Load wave counts for this tile into shared memory
-    // Only load up to numWaves, pad the rest with zeros
-    if (tid < numWaves) {
+    // Load batch counts for this tile into shared memory
+    // Only load up to numBatchs, pad the rest with zeros
+    if (tid < numBatchs) {
         int idx = tid * numTiles + tile;
-        sInput[tid] = (uint)waveCounts[idx];
+        sInput[tid] = (uint)batchCounts[idx];
     }
     __syncthreads();
 
     // Perform exclusive scan using shared memory
-    sharedMemExclusiveScan(tid, sInput, sOutput, sScratch, alignedWaves);
+    sharedMemExclusiveScan(tid, sInput, sOutput, sScratch, alignedBatchs);
     __syncthreads();
 
     // Write results back to global memory
-    if (tid < numWaves) {
+    if (tid < numBatchs) {
         int idx = tid * numTiles + tile;
-        waveBase[idx] = (int)sOutput[tid];
+        batchBase[idx] = (int)sOutput[tid];
     }
 }
 
-// 3) Stable scatter within each wave using wave-local heads, preserving pair order
-__global__ void kernelScatterWaveStable(const int *pairTileId,
+// 3) Stable scatter within each batch using batch-local heads, preserving pair order
+__global__ void kernelScatterBatchStable(const int *pairTileId,
                                         const int *pairCircleId,
                                         int totalPairs,
-                                        int waveSize,
+                                        int batchSize,
                                         int numTiles,
                                         const int *tileOffsets,
-                                        const int *waveBase,
+                                        const int *batchBase,
                                         int *tileIndices)
 {
     int m = blockIdx.x;
-    int waveStart = m * waveSize;
-    if (waveStart >= totalPairs)
+    int batchStart = m * batchSize;
+    if (batchStart >= totalPairs)
         return;
-    int waveEnd = min(waveStart + waveSize, totalPairs);
+    int batchEnd = min(batchStart + batchSize, totalPairs);
 
     extern __shared__ int heads[]; // size = numTiles
     for (int t = threadIdx.x; t < numTiles; t += blockDim.x)
@@ -754,10 +754,10 @@ __global__ void kernelScatterWaveStable(const int *pairTileId,
 
     if (threadIdx.x == 0)
     {
-        for (int k = waveStart; k < waveEnd; k++)
+        for (int k = batchStart; k < batchEnd; k++)
         {
             int tile = pairTileId[k];
-            int pos = tileOffsets[tile] + waveBase[m * numTiles + tile] + heads[tile];
+            int pos = tileOffsets[tile] + batchBase[m * numTiles + tile] + heads[tile];
             tileIndices[pos] = pairCircleId[k];
             heads[tile]++;
         }
@@ -1278,59 +1278,59 @@ void CudaRenderer::render()
     }
     else
     {
-        // Optimized wave sizing
-        int targetWaves;
+        // Optimized batch sizing
+        int targetBatchs;
         if (totalPairs <= 10000) {
-            targetWaves = 64;
+            targetBatchs = 64;
         } else if (totalPairs <= 200000) {
-            targetWaves = 128;
+            targetBatchs = 128;
         } else if (totalPairs <= 1000000) {
-            targetWaves = 256;
+            targetBatchs = 256;
         } else {
-            targetWaves = 512;
+            targetBatchs = 512;
         }
         
-        int waveSize = max(64, (totalPairs + targetWaves - 1) / targetWaves); 
-        int numWaves = (totalPairs + waveSize - 1) / waveSize;
+        int batchSize = max(64, (totalPairs + targetBatchs - 1) / targetBatchs); 
+        int numBatchs = (totalPairs + batchSize - 1) / batchSize;
         
-        int *dWaveCounts = NULL;
-        int *dWaveBase = NULL;
-        cudaMalloc(&dWaveCounts, sizeof(int) * numWaves * numTiles);
-        cudaMalloc(&dWaveBase, sizeof(int) * numWaves * numTiles);
+        int *dBatchCounts = NULL;
+        int *dBatchBase = NULL;
+        cudaMalloc(&dBatchCounts, sizeof(int) * numBatchs * numTiles);
+        cudaMalloc(&dBatchBase, sizeof(int) * numBatchs * numTiles);
 
-        // Count per wave
+        // Count per batch
         int shmemCounts = sizeof(int) * numTiles;
-        kernelCountTilesPerWave<<<numWaves, 256, shmemCounts>>>(dPairTileId, totalPairs, numTiles, waveSize, dWaveCounts);
+        kernelCountTilesPerBatch<<<numBatchs, 256, shmemCounts>>>(dPairTileId, totalPairs, numTiles, batchSize, dBatchCounts);
         
         // Adaptive strategy: choose optimal scan method based on workload
-        int alignedWaves = nextPow2(numWaves);
-        alignedWaves = min(alignedWaves, SCAN_BLOCK_DIM);
+        int alignedBatchs = nextPow2(numBatchs);
+        alignedBatchs = min(alignedBatchs, SCAN_BLOCK_DIM);
         
-        float efficiency = 100.0 * numWaves / alignedWaves;
-        printf("Scan analysis: numWaves=%d, alignedWaves=%d, efficiency=%.1f%%\n", numWaves, alignedWaves, efficiency);
+        float efficiency = 100.0 * numBatchs / alignedBatchs;
+        printf("Scan analysis: numBatchs=%d, alignedBatchs=%d, efficiency=%.1f%%\n", numBatchs, alignedBatchs, efficiency);
 
         double startScanTime = CycleTimer::currentSeconds();
-        if (numWaves >= 64 && efficiency >= 50.0) {
-            int shmemScanSize = sizeof(uint) * (alignedWaves + alignedWaves + 2 * SCAN_BLOCK_DIM);
-            kernelExclusiveScanWaveCountsSharedMem<<<numTiles, alignedWaves, shmemScanSize>>>(dWaveCounts, numWaves, numTiles, dWaveBase, alignedWaves);
+        if (numBatchs >= 64 && efficiency >= 50.0) {
+            int shmemScanSize = sizeof(uint) * (alignedBatchs + alignedBatchs + 2 * SCAN_BLOCK_DIM);
+            kernelExclusiveScanBatchCountsSharedMem<<<numTiles, alignedBatchs, shmemScanSize>>>(dBatchCounts, numBatchs, numTiles, dBatchBase, alignedBatchs);
         } else {
-            kernelExclusiveScanWaveCounts<<<numTiles, 1>>>(dWaveCounts, numWaves, numTiles, dWaveBase);
+            kernelExclusiveScanBatchCounts<<<numTiles, 1>>>(dBatchCounts, numBatchs, numTiles, dBatchBase);
         }
         cudaDeviceSynchronize();
         double endScanTime = CycleTimer::currentSeconds();
         printf("Exclusive scan time: %.3f ms\n", 1000.0 * (endScanTime - startScanTime));
 
-        // Scatter stably within each wave
+        // Scatter stably within each batch
         double startScatterTime = CycleTimer::currentSeconds();
         int shmemHeads = sizeof(int) * numTiles;
-        kernelScatterWaveStable<<<numWaves, 256, shmemHeads>>>(dPairTileId, dPairCircleId, totalPairs,
-                                                               waveSize, numTiles, dTileOffsets, dWaveBase, dTileIndices);
+        kernelScatterBatchStable<<<numBatchs, 256, shmemHeads>>>(dPairTileId, dPairCircleId, totalPairs,
+                                                               batchSize, numTiles, dTileOffsets, dBatchBase, dTileIndices);
         cudaDeviceSynchronize();
         double endScatterTime = CycleTimer::currentSeconds();
         printf("Scatter time: %.3f ms\n", 1000.0 * (endScatterTime - startScatterTime));
 
-        cudaFree(dWaveCounts);
-        cudaFree(dWaveBase);
+        cudaFree(dBatchCounts);
+        cudaFree(dBatchBase);
     }
     cudaDeviceSynchronize();
     double endSortTime = CycleTimer::currentSeconds();
