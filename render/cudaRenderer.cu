@@ -14,6 +14,7 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "../saxpy/CycleTimer.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // All cuda kernels here
@@ -372,11 +373,33 @@ __global__ void kernelPackPosRad4(const float *position,
     ((float4 *)posRad4)[i] = pr;
 }
 
+template<bool isSnowflake>
+__device__ __inline__ void shadePixel(float pixelDist, float rad, float4 pr, int i, float3& rgb, float& alpha)
+{
+    if constexpr (isSnowflake)
+    {
+        const float kCircleMaxAlpha = .5f;
+        const float falloffScale = 4.f;
+        float normPixelDist = sqrtf(pixelDist) / rad;
+        rgb = lookupColor(normPixelDist);
+        float maxAlpha = .6f + .4f * (1.f - pr.z);
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+        alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
+    }
+    else
+    {
+        int index3 = 3 * i;
+        rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
+        alpha = .5f;
+    }
+}
+
 // kernelRenderPixels -- (CUDA device code)
 //
 // Each thread shades one pixel by looping over all circles in input order.
 // This preserves per-pixel ordering and avoids atomics because a single
 // thread owns the pixel's full read-modify-write sequence.
+template<bool isSnowflake>
 __global__ void kernelRenderPixels()
 {
 
@@ -423,22 +446,7 @@ __global__ void kernelRenderPixels()
         // Shade: compute rgb and alpha for this circle at this pixel
         float3 rgb;
         float alpha;
-        if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
-        {
-            const float kCircleMaxAlpha = .5f;
-            const float falloffScale = 4.f;
-            float normPixelDist = sqrtf(pixelDist) / rad;
-            rgb = lookupColor(normPixelDist);
-            float maxAlpha = .6f + .4f * (1.f - pr.z);
-            maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-            alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
-        }
-        else
-        {
-            int index3 = 3 * i;
-            rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
-            alpha = .5f;
-        }
+        shadePixel<isSnowflake>(pixelDist, rad, pr, i, rgb, alpha);
 
         // In-order blend into this pixel (local registers)
         float oneMinus = 1.f - alpha;
@@ -477,31 +485,44 @@ __global__ void kernelCountTilesPerCircle(int tilesX,
     float cy = pr.y;
     float radius = pr.w;
 
-    // Convert to normalized coordinates for tile calculations
-    // We use normalized coordinates (in [0,1]) so that all geometric calculations are independent of the actual image resolution.
-    // This allows us to easily compare circle and tile positions and sizes, regardless of pixel dimensions.
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
     float tileW_norm = tileW * invWidth;
     float tileH_norm = tileH * invHeight;
 
     int count = 0;
+    // O(tilesX * tilesY) -> O(intersected tiles)
+    float txMinF = (cx - radius) / tileW_norm;
+    float txMaxF = (cx + radius) / tileW_norm;
+    float tyMinF = (cy - radius) / tileH_norm;
+    float tyMaxF = (cy + radius) / tileH_norm;
 
-    // Test each tile for intersection with the circle
-    for (int ty = 0; ty < tilesY; ty++)
+    int txMin = (int)floorf(txMinF);
+    int txMax = (int)floorf(txMaxF);
+    int tyMin = (int)floorf(tyMinF);
+    int tyMax = (int)floorf(tyMaxF);
+
+    txMin = max(0, txMin);
+    tyMin = max(0, tyMin);
+    txMax = min(tilesX - 1, txMax);
+    tyMax = min(tilesY - 1, tyMax);
+
+    if (txMin <= txMax && tyMin <= tyMax)
     {
-        for (int tx = 0; tx < tilesX; tx++)
+        // Test each candidate tile for precise intersection with the circle
+        for (int ty = tyMin; ty <= tyMax; ty++)
         {
-            // Convert tile to normalized coordinates
-            float tileL = tx * tileW_norm;
-            float tileR = (tx + 1) * tileW_norm;
-            float tileB = ty * tileH_norm;
-            float tileT = (ty + 1) * tileH_norm;
-
-            // Test if circle intersects this tile using precise intersection test
-            if (circleInBox(cx, cy, radius, tileL, tileR, tileT, tileB))
+            for (int tx = txMin; tx <= txMax; tx++)
             {
-                count++;
+                float tileL = tx * tileW_norm;
+                float tileR = (tx + 1) * tileW_norm;
+                float tileB = ty * tileH_norm;
+                float tileT = (ty + 1) * tileH_norm;
+
+                if (circleInBox(cx, cy, radius, tileL, tileR, tileT, tileB))
+                {
+                    count++;
+                }
             }
         }
     }
@@ -510,26 +531,29 @@ __global__ void kernelCountTilesPerCircle(int tilesX,
 }
 
 // Write pairs (tileId, circleIdx) for each circle into a contiguous segment
-__global__ void kernelWriteCircleTilePairs(const float *position,
-                                           const float *radius,
-                                           int numCircles,
-                                           int imageWidth,
-                                           int imageHeight,
+__global__ void kernelWriteCircleTilePairs(
                                            int tilesX,
                                            int tilesY,
                                            int tileW,
                                            int tileH,
                                            const int *circleBase, // An array where circleBase[i] gives the starting index in the output arrays for the i-th circle's tile pairs.
                                            int *pairTileId,       // Output array to store the tile ID for each (tile, circle) pair that the circle overlaps.
-                                           int *pairCircleIdx)    // Output array to store the circle index for each (tile, circle) pair; aligns with pairTileId.
+                                           int *pairCircleId)    // Output array to store the circle index for each (tile, circle) pair; aligns with pairTileId.
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= numCircles)
+    int circleIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int numCircles = cuConstRendererParams.numberOfCircles;
+    if (circleIdx >= numCircles)
         return;
 
-    float cx = position[3 * i + 0];
-    float cy = position[3 * i + 1];
-    float r = radius[i];
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+
+    int index4 = 4 * circleIdx;
+    float4 pr = *(float4 *)(&cuConstRendererParams.posRad4[index4]);
+
+    float cx = pr.x;
+    float cy = pr.y;
+    float r = pr.w;
 
     // Convert to normalized coordinates for tile calculations
     float invWidth = 1.f / imageWidth;
@@ -537,28 +561,44 @@ __global__ void kernelWriteCircleTilePairs(const float *position,
     float tileW_norm = tileW * invWidth;
     float tileH_norm = tileH * invHeight;
 
-    int base = circleBase[i];
+    int base = circleBase[circleIdx];
     int pairOffset = 0;
+    // Compute candidate tile bbox from circle AABB
+    float txMinF = (cx - r) / tileW_norm;
+    float txMaxF = (cx + r) / tileW_norm;
+    float tyMinF = (cy - r) / tileH_norm;
+    float tyMaxF = (cy + r) / tileH_norm;
 
-    // Test each tile for intersection with the circle
-    for (int ty = 0; ty < tilesY; ty++)
+    int txMin = (int)floorf(txMinF);
+    int txMax = (int)floorf(txMaxF);
+    int tyMin = (int)floorf(tyMinF);
+    int tyMax = (int)floorf(tyMaxF);
+
+    txMin = max(0, txMin);
+    tyMin = max(0, tyMin);
+    txMax = min(tilesX - 1, txMax);
+    tyMax = min(tilesY - 1, tyMax);
+
+    if (txMin <= txMax && tyMin <= tyMax)
     {
-        for (int tx = 0; tx < tilesX; tx++)
+        // Test candidate tiles and write pairs for precise intersections
+        for (int ty = tyMin; ty <= tyMax; ty++)
         {
-            // Convert tile to normalized coordinates
-            float tileL = tx * tileW_norm;
-            float tileR = (tx + 1) * tileW_norm;
-            float tileB = ty * tileH_norm;
-            float tileT = (ty + 1) * tileH_norm;
-
-            // Test if circle intersects this tile using precise intersection test
-            if (circleInBox(cx, cy, r, tileL, tileR, tileT, tileB))
+            for (int tx = txMin; tx <= txMax; tx++)
             {
-                int tileId = ty * tilesX + tx;
-                int pairIdx = base + pairOffset;
-                pairTileId[pairIdx] = tileId;
-                pairCircleIdx[pairIdx] = i;
-                pairOffset++;
+                float tileL = tx * tileW_norm;
+                float tileR = (tx + 1) * tileW_norm;
+                float tileB = ty * tileH_norm;
+                float tileT = (ty + 1) * tileH_norm;
+
+                if (circleInBox(cx, cy, r, tileL, tileR, tileT, tileB))
+                {
+                    int tileIdx = ty * tilesX + tx;
+                    int pairIdx = base + pairOffset;
+                    pairTileId[pairIdx] = tileIdx;
+                    pairCircleId[pairIdx] = circleIdx;
+                    pairOffset++;
+                }
             }
         }
     }
@@ -570,16 +610,33 @@ __global__ void kernelHistogramTilesFromPairs(const int *pairTileId,
                                               int numTiles,
                                               int *tileCounts)
 {
-    int k = blockIdx.x * blockDim.x + threadIdx.x;
-    if (k >= totalPairs)
-        return;
-    int tileId = pairTileId[k];
-    if (tileId >= 0 && tileId < numTiles)
-        atomicAdd(&tileCounts[tileId], 1);
+    // Use shared memory to reduce atomic operations
+    extern __shared__ int sCounts[];
+    
+    // Initialize shared memory
+    for (int t = threadIdx.x; t < numTiles; t += blockDim.x)
+        sCounts[t] = 0;
+    __syncthreads();
+    
+    int pairIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    
+    // Process pairs in chunks to reduce atomic contention
+    while (pairIdx < totalPairs) {
+        int tileId = pairTileId[pairIdx];
+        if (tileId >= 0 && tileId < numTiles) {
+            atomicAdd(&sCounts[tileId], 1);
+        }
+        pairIdx += stride;
+    }
+    __syncthreads();
+    
+    // Write shared memory results to global memory
+    for (int t = threadIdx.x; t < numTiles; t += blockDim.x)
+        atomicAdd(&tileCounts[t], sCounts[t]);
 }
 
-// Device-side stable counting sort by tiles using "waves" (waves are contiguous blocks of K entries, i.e., each wave processes up to waveSize pairs)
-// 1) Count tiles per wave into waveCounts[m][tile]
+// Count tiles per wave into waveCounts[m][tile]
 //    - Here, a "wave" refers to a chunk of up to waveSize consecutive (tile, circle) pairs.
 //    - Each block processes one wave (i.e., a range of indices [m*waveSize, (m+1)*waveSize)), allowing the sort to be performed in manageable batches.
 __global__ void kernelCountTilesPerWave(const int *pairTileId,
@@ -676,7 +733,7 @@ __global__ void kernelExclusiveScanWaveCountsSharedMem(const int *waveCounts,
 
 // 3) Stable scatter within each wave using wave-local heads, preserving pair order
 __global__ void kernelScatterWaveStable(const int *pairTileId,
-                                        const int *pairCircleIdx,
+                                        const int *pairCircleId,
                                         int totalPairs,
                                         int waveSize,
                                         int numTiles,
@@ -701,7 +758,7 @@ __global__ void kernelScatterWaveStable(const int *pairTileId,
         {
             int tile = pairTileId[k];
             int pos = tileOffsets[tile] + waveBase[m * numTiles + tile] + heads[tile];
-            tileIndices[pos] = pairCircleIdx[k];
+            tileIndices[pos] = pairCircleId[k];
             heads[tile]++;
         }
     }
@@ -714,6 +771,7 @@ __global__ void kernelScatterWaveStable(const int *pairTileId,
 #ifndef DIRECT_SEG_LIMIT
 #define DIRECT_SEG_LIMIT 64
 #endif
+template<bool isSnowflake>
 __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
                                          const int *tileIndices,
                                          int tilesNumX,
@@ -776,22 +834,7 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
 
             float3 rgb;
             float alpha;
-            if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
-            {
-                const float kCircleMaxAlpha = .5f;
-                const float falloffScale = 4.f;
-                float normPixelDist = sqrtf(pixelDist) / rad;
-                rgb = lookupColor(normPixelDist);
-                float maxAlpha = .6f + .4f * (1.f - pr.z);
-                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-                alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
-            }
-            else
-            {
-                int index3 = 3 * i;
-                rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
-                alpha = .5f;
-            }
+            shadePixel<isSnowflake>(pixelDist, rad, pr, i, rgb, alpha);
 
             float oneMinus = 1.f - alpha;
             r = alpha * rgb.x + oneMinus * r;
@@ -838,23 +881,8 @@ __global__ void kernelRenderPixelsBinned(const int *tileOffsets,
 
             float3 rgb;
             float alpha;
-            if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME)
-            {
-                const float kCircleMaxAlpha = .5f;
-                const float falloffScale = 4.f;
-                float normPixelDist = sqrtf(pixelDist) / rad;
-                rgb = lookupColor(normPixelDist);
-                float maxAlpha = .6f + .4f * (1.f - pr.z);
-                maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
-                alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
-            }
-            else
-            {
-                int i = sIdx[j];
-                int index3 = 3 * i;
-                rgb = *(float3 *)&(cuConstRendererParams.color[index3]);
-                alpha = .5f;
-            }
+            int i = sIdx[j];
+            shadePixel<isSnowflake>(pixelDist, rad, pr, i, rgb, alpha);
 
             float oneMinus = 1.f - alpha;
             r = alpha * rgb.x + oneMinus * r;
@@ -1130,12 +1158,20 @@ void CudaRenderer::render()
         dim3 gridDim(
             (image->width + blockDim.x - 1) / blockDim.x,
             (image->height + blockDim.y - 1) / blockDim.y);
-        kernelRenderPixels<<<gridDim, blockDim>>>();
+        
+        if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME)
+        {
+            kernelRenderPixels<true><<<gridDim, blockDim>>>();
+        }
+        else
+        {
+            kernelRenderPixels<false><<<gridDim, blockDim>>>();
+        }
         cudaDeviceSynchronize();
         return;
     }
 
-    // Tiled, order-correct rendering using CSR bins (built each frame)
+    // Tiled, order-correct rendering
 
     // 1) Compute tile grid (align block=tile; keep <=1024 threads per block)
     int tileW = 32;
@@ -1152,6 +1188,7 @@ void CudaRenderer::render()
     kernelCountTilesPerCircle<<<gridCount, blockCount>>>(tilesX, tilesY, tileW, tileH, dCircleCounts);
 
     // 3) Host exclusive scan over per-circle counts -> circleBase, totalPairs
+    double startCircleBaseTime = CycleTimer::currentSeconds();
     std::vector<int> hCircleCounts(numberOfCircles);
     cudaMemcpy(hCircleCounts.data(), dCircleCounts, sizeof(int) * numberOfCircles, cudaMemcpyDeviceToHost);
     std::vector<int> hCircleBase(numberOfCircles + 1);
@@ -1163,17 +1200,22 @@ void CudaRenderer::render()
     int *dCircleBase = NULL;
     cudaMalloc(&dCircleBase, sizeof(int) * numberOfCircles);
     cudaMemcpy(dCircleBase, hCircleBase.data(), sizeof(int) * numberOfCircles, cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+    double endCircleBaseTime = CycleTimer::currentSeconds();
+    printf("Circle base time: %.3f ms\n", 1000.0 * (endCircleBaseTime - startCircleBaseTime));
 
     // 4) Build pairs (tileId, circleIdx) by circle (device, ordered by circle)
+    double startWritePairsTime = CycleTimer::currentSeconds();
     int *dPairTileId = NULL;
-    int *dPairCircleIdx = NULL;
+    int *dPairCircleId = NULL;
     cudaMalloc(&dPairTileId, sizeof(int) * totalPairs);
-    cudaMalloc(&dPairCircleIdx, sizeof(int) * totalPairs);
-    kernelWriteCircleTilePairs<<<gridCount, blockCount>>>(
-        cudaDevicePosition, cudaDeviceRadius, numberOfCircles,
-        image->width, image->height,
+    cudaMalloc(&dPairCircleId, sizeof(int) * totalPairs);
+    kernelWriteCircleTilePairs<<<gridCount, blockCount>>>( // O(numberOfCircles * tilesX * tilesY)
         tilesX, tilesY, tileW, tileH,
-        dCircleBase, dPairTileId, dPairCircleIdx);
+        dCircleBase, dPairTileId, dPairCircleId);
+    cudaDeviceSynchronize();
+    double endWritePairsTime = CycleTimer::currentSeconds();
+    printf("Build pairs time: %.3f ms\n", 1000.0 * (endWritePairsTime - startWritePairsTime));
 
     // 5) Histogram tiles from pairs -> counts (device); host scan -> CSR offsets
     int *dTileCounts = NULL;
@@ -1181,8 +1223,15 @@ void CudaRenderer::render()
     cudaMemset(dTileCounts, 0, sizeof(int) * numTiles);
     dim3 blockPairs(256, 1, 1);
     dim3 gridPairs((totalPairs + blockPairs.x - 1) / blockPairs.x, 1, 1);
-    kernelHistogramTilesFromPairs<<<gridPairs, blockPairs>>>(dPairTileId, totalPairs, numTiles, dTileCounts);
 
+    double startHistogramTime = CycleTimer::currentSeconds();
+    int shmemHistSize = sizeof(int) * numTiles;
+    kernelHistogramTilesFromPairs<<<gridPairs, blockPairs, shmemHistSize>>>(dPairTileId, totalPairs, numTiles, dTileCounts);
+    cudaDeviceSynchronize();
+    double endHistogramTime = CycleTimer::currentSeconds();
+    printf("Histogram tiles from pairs time: %.3f ms\n", 1000.0 * (endHistogramTime - startHistogramTime));
+    
+    double startHostOffsetsTime = CycleTimer::currentSeconds();
     std::vector<int> hCounts(numTiles);
     cudaMemcpy(hCounts.data(), dTileCounts, sizeof(int) * numTiles, cudaMemcpyDeviceToHost);
     std::vector<int> hOffsets(numTiles + 1);
@@ -1190,23 +1239,30 @@ void CudaRenderer::render()
     for (int t = 0; t < numTiles; t++)
         hOffsets[t + 1] = hOffsets[t] + hCounts[t];
 
+    // tileOffsets is a CSR (Compressed Sparse Row) array of length (numTiles + 1).
+    // For each tileId, tileOffsets[tileId] gives the starting index in the tileIndices array
+    // for the circles that overlap this tile. tileOffsets[tileId+1] is the end index (exclusive).
     int *dTileOffsets = NULL;
     cudaMalloc(&dTileOffsets, sizeof(int) * (numTiles + 1));
     cudaMemcpy(dTileOffsets, hOffsets.data(), sizeof(int) * (numTiles + 1), cudaMemcpyHostToDevice);
+    cudaDeviceSynchronize();
+    double endHostOffsetsTime = CycleTimer::currentSeconds();
+    printf("Host offsets time: %.3f ms\n", 1000.0 * (endHostOffsetsTime - startHostOffsetsTime));
 
     // 6) Stable counting sort by tiles
-    int *dTileIndices = NULL;
+    double startSortTime = CycleTimer::currentSeconds();
+    int *dTileIndices = NULL; // tileIndices is an array of length totalPairs, where each element is circleId in the tileIndices array.
     cudaMalloc(&dTileIndices, sizeof(int) * totalPairs);
 
     const int pairCutoff = 5000;
-    printf("totalPairs: %d\n", totalPairs);
+    printf("totalPairs: %d, tilesX: %d, tilesY: %d\n", totalPairs, tilesX, tilesY);
     if (totalPairs <= pairCutoff)
     {
         // Host-side stable scatter (only for very small sizes)
         std::vector<int> hPairTileId(totalPairs);
         std::vector<int> hPairCircleIdx(totalPairs);
         cudaMemcpy(hPairTileId.data(), dPairTileId, sizeof(int) * totalPairs, cudaMemcpyDeviceToHost);
-        cudaMemcpy(hPairCircleIdx.data(), dPairCircleIdx, sizeof(int) * totalPairs, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hPairCircleIdx.data(), dPairCircleId, sizeof(int) * totalPairs, cudaMemcpyDeviceToHost);
 
         std::vector<int> hTileIndices(totalPairs);
         std::vector<int> heads(numTiles);
@@ -1222,20 +1278,21 @@ void CudaRenderer::render()
     }
     else
     {
-        // Optimized wave sizing for medium-sized workloads (2000-10000 pairs)
+        // Optimized wave sizing
         int targetWaves;
         if (totalPairs <= 10000) {
             targetWaves = 64;
         } else if (totalPairs <= 200000) {
+            targetWaves = 128;
+        } else if (totalPairs <= 1000000) {
             targetWaves = 256;
         } else {
-            targetWaves = 512; // Large waves for big workloads
+            targetWaves = 512;
         }
         
         int waveSize = max(64, (totalPairs + targetWaves - 1) / targetWaves); 
         int numWaves = (totalPairs + waveSize - 1) / waveSize;
         
-        printf("Adaptive wave sizing, waveSize=%d, numWaves=%d\n", waveSize, numWaves);
         int *dWaveCounts = NULL;
         int *dWaveBase = NULL;
         cudaMalloc(&dWaveCounts, sizeof(int) * numWaves * numTiles);
@@ -1251,33 +1308,56 @@ void CudaRenderer::render()
         
         float efficiency = 100.0 * numWaves / alignedWaves;
         printf("Scan analysis: numWaves=%d, alignedWaves=%d, efficiency=%.1f%%\n", numWaves, alignedWaves, efficiency);
-        
+
+        double startScanTime = CycleTimer::currentSeconds();
         if (numWaves >= 64 && efficiency >= 50.0) {
             int shmemScanSize = sizeof(uint) * (alignedWaves + alignedWaves + 2 * SCAN_BLOCK_DIM);
             kernelExclusiveScanWaveCountsSharedMem<<<numTiles, alignedWaves, shmemScanSize>>>(dWaveCounts, numWaves, numTiles, dWaveBase, alignedWaves);
         } else {
             kernelExclusiveScanWaveCounts<<<numTiles, 1>>>(dWaveCounts, numWaves, numTiles, dWaveBase);
         }
+        cudaDeviceSynchronize();
+        double endScanTime = CycleTimer::currentSeconds();
+        printf("Exclusive scan time: %.3f ms\n", 1000.0 * (endScanTime - startScanTime));
 
-        // Scatter stably within each wave into final CSR locations
+        // Scatter stably within each wave
+        double startScatterTime = CycleTimer::currentSeconds();
         int shmemHeads = sizeof(int) * numTiles;
-        kernelScatterWaveStable<<<numWaves, 256, shmemHeads>>>(dPairTileId, dPairCircleIdx, totalPairs,
+        kernelScatterWaveStable<<<numWaves, 256, shmemHeads>>>(dPairTileId, dPairCircleId, totalPairs,
                                                                waveSize, numTiles, dTileOffsets, dWaveBase, dTileIndices);
+        cudaDeviceSynchronize();
+        double endScatterTime = CycleTimer::currentSeconds();
+        printf("Scatter time: %.3f ms\n", 1000.0 * (endScatterTime - startScatterTime));
 
         cudaFree(dWaveCounts);
         cudaFree(dWaveBase);
     }
+    cudaDeviceSynchronize();
+    double endSortTime = CycleTimer::currentSeconds();
+    printf("Stable sort time: %.3f ms\n", 1000.0 * (endSortTime - startSortTime));
 
     // 7) Render per pixel binning (one block per tile, one thread per pixel)
+    double startRenderTime = CycleTimer::currentSeconds();
     dim3 blockRender(tileW, tileH, 1);
     dim3 gridRender(tilesX, tilesY);
-    kernelRenderPixelsBinned<<<gridRender, blockRender>>>(dTileOffsets, dTileIndices, tilesX, tileW, tileH);
+    
+    if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME)
+    {
+        kernelRenderPixelsBinned<true><<<gridRender, blockRender>>>(dTileOffsets, dTileIndices, tilesX, tileW, tileH);
+    }
+    else
+    {
+        kernelRenderPixelsBinned<false><<<gridRender, blockRender>>>(dTileOffsets, dTileIndices, tilesX, tileW, tileH);
+    }
+    cudaDeviceSynchronize();
+    double endRenderTime = CycleTimer::currentSeconds();
+    printf("Render time: %.3f ms\n", 1000.0 * (endRenderTime - startRenderTime));
 
-    // 8) Cleanup temporaries
+    // 8) Cleanup
     cudaFree(dCircleCounts);
     cudaFree(dCircleBase);
     cudaFree(dPairTileId);
-    cudaFree(dPairCircleIdx);
+    cudaFree(dPairCircleId);
     cudaFree(dTileCounts);
     cudaFree(dTileOffsets);
     cudaFree(dTileIndices);
